@@ -762,6 +762,14 @@ struct NormQuantKernel {
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3V);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3V);
             }
+            // P == 1: the next row iteration overwrites `fp` with an MTE2
+            // DataCopy, while the V pipe may still be consuming the current
+            // row. Close the V -> MTE2 dependency once per row, after the last
+            // V access to `fp` and before the next row's DataCopy.
+            if (!multiSplit) {
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vMte2);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vMte2);
+            }
         }
 
         pipe->ReleaseEventID<AscendC::HardEvent::MTE2_V>(mte2V);
