@@ -26,6 +26,11 @@ struct Dsv41MlaPrologArguments {
     void *workspace;
     uint64_t workspaceSize;
     int32_t t;
+    // Required BF16 [t,1280] output; the same normalized row that feeds
+    // dynamic quantization: q_norm(wq_a(x)).
+    uint16_t *qr;
+    // FP32 RMSNorm epsilon for both branches; finite and > 0, default 1e-6.
+    float rmsNormEps;
 };
 
 uint64_t GetDsv41MlaPrologWorkspaceSize(const Dsv41MlaPrologArguments &args);

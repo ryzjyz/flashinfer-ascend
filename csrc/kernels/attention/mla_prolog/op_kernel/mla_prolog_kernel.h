@@ -388,6 +388,11 @@ struct NormQuantKernel {
         GM_ADDR wScaleFp;
         uint32_t t;
         uint32_t projectionSplits;
+        // Required BF16 [t,1280] output: the same normalized BF16 row that
+        // feeds dynamic quantization, i.e. q_norm(wq_a(x)).
+        GM_ADDR qr;
+        // FP32 RMSNorm epsilon applied to both the Q and the KV branch.
+        float rmsNormEps;
     };
     using Arguments = Params;
 
@@ -396,7 +401,8 @@ struct NormQuantKernel {
         return args.qa != nullptr && args.kv != nullptr && args.kvNorm != nullptr &&
             args.gammaQa != nullptr &&
             args.gammaKv != nullptr && args.qInt8 != nullptr && args.qScale != nullptr &&
-            args.wScale != nullptr && args.wScaleFp != nullptr &&
+            args.wScale != nullptr && args.wScaleFp != nullptr && args.qr != nullptr &&
+            args.rmsNormEps > 0.0F &&
             args.t > 0 && args.t <= kMaxT &&
             args.projectionSplits > 0 &&
             args.projectionSplits <= kMaxProjectionSplits;
@@ -468,6 +474,7 @@ struct NormQuantKernel {
         AscendC::GlobalTensor<float> gmQScale;
         AscendC::GlobalTensor<bfloat16_t> gmWScale;
         AscendC::GlobalTensor<float> gmWScaleFp;
+        AscendC::GlobalTensor<bfloat16_t> gmQr;
         gmQa.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.qa));
         gmKv.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.kv));
         gmKvNorm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.kvNorm));
@@ -477,6 +484,7 @@ struct NormQuantKernel {
         gmQScale.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.qScale));
         gmWScale.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.wScale));
         gmWScaleFp.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.wScaleFp));
+        gmQr.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.qr));
 
         auto *pipe = GetTPipePtr();
         const int32_t mte2V = pipe->AllocEventID<AscendC::HardEvent::MTE2_V>();
@@ -640,7 +648,7 @@ struct NormQuantKernel {
             AscendC::WaitFlag<AscendC::HardEvent::V_S>(vS);
             const float invDim = isQ ? (1.0F / 1280.0F) : (1.0F / 512.0F);
             AscendC::Muls(scalar, scalar, invDim, 1);
-            AscendC::Adds(scalar, scalar, 1.0e-6F, 1);
+            AscendC::Adds(scalar, scalar, params.rmsNormEps, 1);
             AscendC::Sqrt(scalar[8], scalar, 1);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Duplicate(scalar[16], 1.0F, 1);
@@ -753,6 +761,15 @@ struct NormQuantKernel {
                 AscendC::DataCopy(gmQInt8[offset], quantInt8, 512);
                 AscendC::DataCopy(gmQInt8[offset + 512], quantInt8[512], 512);
                 AscendC::DataCopy(gmQInt8[offset + 1024], quantInt8[1024], 256);
+                // qr = q_norm(wq_a(x)): reuse the `normBf16` row that this
+                // iteration already materialized for dynamic quantization, so
+                // the required second output adds GM write traffic only (no
+                // compute). The V_MTE3 flag above already orders every prior V
+                // write (including normBf16) before these MTE3 copies, and the
+                // MTE3_V wait below covers all six stores before UB reuse.
+                AscendC::DataCopy(gmQr[offset], normBf16, 512);
+                AscendC::DataCopy(gmQr[offset + 512], normBf16[512], 512);
+                AscendC::DataCopy(gmQr[offset + 1024], normBf16[1024], 256);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3V);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3V);
             } else {

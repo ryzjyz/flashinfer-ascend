@@ -21,8 +21,10 @@ using namespace ge;
 namespace ops {
 constexpr size_t X_INPUT_INDEX = 0;
 constexpr size_t Q_OUTPUT_INDEX = 0;
+constexpr size_t QR_OUTPUT_INDEX = 1;
 constexpr uint32_t HEADS = 64;
 constexpr uint32_t HEAD_DIM = 512;
+constexpr uint32_t Q_LORA = 1280;
 
 ge::graphStatus InferShapeMlaProlog(gert::InferShapeContext *context)
 {
@@ -39,6 +41,11 @@ ge::graphStatus InferShapeMlaProlog(gert::InferShapeContext *context)
     qShape->SetDim(0, xShape->GetDim(0));
     qShape->SetDim(1, HEADS);
     qShape->SetDim(2, HEAD_DIM);
+    gert::Shape *qrShape = context->GetOutputShape(QR_OUTPUT_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, qrShape);
+    qrShape->SetDimNum(2);
+    qrShape->SetDim(0, xShape->GetDim(0));
+    qrShape->SetDim(1, Q_LORA);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -46,6 +53,7 @@ ge::graphStatus InferDataTypeMlaProlog(gert::InferDataTypeContext *context)
 {
     OP_CHECK_NULL_WITH_CONTEXT(context, context);
     context->SetOutputDataType(Q_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
+    context->SetOutputDataType(QR_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
     return ge::GRAPH_SUCCESS;
 }
 

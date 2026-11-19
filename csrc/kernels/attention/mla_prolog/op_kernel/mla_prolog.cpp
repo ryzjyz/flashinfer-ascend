@@ -36,7 +36,7 @@ template <class TilingData>
 CATLASS_DEVICE void MlaPrologDevice(
     GM_ADDR x, GM_ADDR wQa, GM_ADDR gammaQa, GM_ADDR wQb, GM_ADDR wQbScale,
     GM_ADDR wKv, GM_ADDR gammaKv, GM_ADDR ropeCos, GM_ADDR ropeSin,
-    GM_ADDR slotIndices, GM_ADDR kvCache, GM_ADDR qOutput,
+    GM_ADDR slotIndices, GM_ADDR kvCache, GM_ADDR qOutput, GM_ADDR qr,
     GM_ADDR userWorkspace, const __gm__ TilingData *tilingData)
 {
     const uint32_t t = tilingData->t;
@@ -55,9 +55,12 @@ CATLASS_DEVICE void MlaPrologDevice(
         GemmCoord(t, Dsv41::kKv, Dsv41::kHidden),
         x, wQa, wKv, qa, kv,
         tilingData->projectionSplits, tilingData->narrowM};
+    // rmsNormEps travels in the host tiling payload: the CANN op-package
+    // kernel ABI forwards only Tensor arguments plus workspace/tiling, so the
+    // OpDef attribute is parsed by host tiling and read here.
     Dsv41::NormQuantKernel::Arguments normArgs{
         qa, kv, kvNorm, gammaQa, gammaKv, qInt8, qScale, wQbScale, wScaleFp,
-        t, tilingData->projectionSplits};
+        t, tilingData->projectionSplits, qr, tilingData->rmsNormEps};
     Dsv41::RopeScatterKernel::Arguments ropeArgs{
         qOutput, kvNorm, ropeCos, ropeSin, slotIndices, kvCache, t};
 
@@ -91,7 +94,7 @@ CATLASS_DEVICE void MlaPrologDevice(
 extern "C" __global__ __aicore__ void fi_mla_prolog(
     GM_ADDR x, GM_ADDR wQa, GM_ADDR gammaQa, GM_ADDR wQb, GM_ADDR wQbScale,
     GM_ADDR wKv, GM_ADDR gammaKv, GM_ADDR ropeCos, GM_ADDR ropeSin,
-    GM_ADDR slotIndices, GM_ADDR kvCache, GM_ADDR qOutput,
+    GM_ADDR slotIndices, GM_ADDR kvCache, GM_ADDR qOutput, GM_ADDR qr,
     GM_ADDR workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
@@ -101,13 +104,14 @@ extern "C" __global__ __aicore__ void fi_mla_prolog(
     }
     AscendC::SetSysWorkspace(workspace);
     auto *data = reinterpret_cast<__gm__ MlaPrologTilingData *>(tiling);
-    if (data->version != 1 || data->t < 1 || data->t > Dsv41::kMaxT ||
-        data->aicNum == 0 || data->hardwareSyncAddr == 0) {
+    if (data->version != 2 || data->t < 1 || data->t > Dsv41::kMaxT ||
+        data->aicNum == 0 || data->hardwareSyncAddr == 0 ||
+        !(data->rmsNormEps > 0.0F)) {
         return;
     }
     AscendC::SetSyncBaseAddr(data->hardwareSyncAddr);
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
     MlaPrologDevice<MlaPrologTilingData>(
         x, wQa, gammaQa, wQb, wQbScale, wKv, gammaKv, ropeCos, ropeSin,
-        slotIndices, kvCache, qOutput, userWorkspace, data);
+        slotIndices, kvCache, qOutput, qr, userWorkspace, data);
 }

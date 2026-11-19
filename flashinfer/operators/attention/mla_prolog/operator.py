@@ -3,7 +3,8 @@
 The public contract is one BF16 token block ``x`` of shape ``[T, 5120]`` with
 ``T`` in ``[1, 4096]``. The fused chain is:
 
-1. ``x @ w_qa.T`` then RMSNorm with ``gamma_qa``;
+1. ``x @ w_qa.T`` then RMSNorm with ``gamma_qa``; the same BF16 normalized row
+   is the required output ``qr[T, 1280] = q_norm(wq_a(x))``;
 2. dynamic per-token INT8 quantization of the normalized Q-LoRA activation;
 3. INT8 ``@ w_qb`` with per-token and per-output-channel dequantization;
 4. partial RoPE on the last 64 of 512 head channels, producing
@@ -11,6 +12,10 @@ The public contract is one BF16 token block ``x`` of shape ``[T, 5120]`` with
 5. ``x @ w_kv.T`` then RMSNorm with ``gamma_kv``, partial RoPE, and an in-place
    scatter of the 512 values into ``kv_cache`` rows addressed by
    ``slot_indices[T, 2]``.
+
+``rms_norm_eps`` is the FP32 epsilon added to both RMSNorm branches; the
+default ``1e-6`` preserves the frozen contract and DS4.1 callers may pass
+``1e-20``. It must be finite and strictly positive.
 
 The cache rows not addressed by ``slot_indices`` are untouched sentinels.
 
@@ -23,6 +28,8 @@ maintainer-approved schema extension) is still unresolved. See
 ``post_final/flashinfer_submission/gap_analysis.md`` in the evolution output
 for the open items; do not treat this declaration as a verified public API.
 """
+
+import math
 
 from flashinfer.operators import Invocation, OperatorDefinition, OutputSpec
 from flashinfer.runtime import InferenceSpec, QuantSpec
@@ -46,7 +53,13 @@ INPUT_NAMES = (
     "x", "w_qa", "gamma_qa", "w_qb", "w_qb_scale", "w_kv", "gamma_kv",
     "rope_cos", "rope_sin", "slot_indices", "kv_cache",
 )
-OUTPUT_NAMES = ("q_output",)
+OUTPUT_NAMES = ("q_output", "qr")
+# rms_norm_eps is a host-side FP32 scalar. The ACLNN attribute carries float64;
+# the minimum is the smallest positive float32 normal so zero and negative
+# values are rejected at the public boundary.
+RMS_NORM_EPS_DEFAULT = 1.0e-6
+RMS_NORM_EPS_MINIMUM = 1.1754943508222875e-38
+RMS_NORM_EPS_MAXIMUM = 3.4028234663852886e38
 FUSION_OPS = (
     "dual_projection", "rms_norm", "dynamic_quantize",
     "quant_matmul", "partial_rope", "kv_cache_scatter",
@@ -76,6 +89,11 @@ def infer(arguments, layouts):
     x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv, rope_cos, rope_sin, slots, cache = (
         arguments[name] for name in INPUT_NAMES
     )
+    rms_norm_eps = arguments.get("rms_norm_eps", RMS_NORM_EPS_DEFAULT)
+    if (type(rms_norm_eps) not in (int, float)
+            or not math.isfinite(rms_norm_eps) or rms_norm_eps <= 0):
+        raise ValueError("rms_norm_eps must be finite and > 0")
+    rms_norm_eps = float(rms_norm_eps)
     t = int(x.shape[0]) if len(x.shape) == 2 else -1
     if t < MIN_T or t > MAX_T:
         raise ValueError("x must have shape [T, 5120] with T in [1, 4096]")
@@ -120,8 +138,11 @@ def infer(arguments, layouts):
                 raise ValueError(f"{name} requires {layout} physical layout")
     return Invocation(
         tuple(arguments[name] for name in INPUT_NAMES),
-        (OutputSpec((t, HEADS, HEAD_DIM), "bfloat16", x.device),),
-        {},
+        (
+            OutputSpec((t, HEADS, HEAD_DIM), "bfloat16", x.device),
+            OutputSpec((t, Q_LORA), "bfloat16", x.device),
+        ),
+        {"rms_norm_eps": rms_norm_eps},
         InferenceSpec(
             compute_dtype="bfloat16", accumulator_dtype="float32",
             quantization=QUANTIZATION, fusion_ops=FUSION_OPS,
@@ -169,27 +190,32 @@ def validate_values(arguments):
 
 
 def _arguments(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-               rope_cos, rope_sin, slot_indices, kv_cache):
+               rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps):
     return {
         "x": x, "w_qa": w_qa, "gamma_qa": gamma_qa, "w_qb": w_qb,
         "w_qb_scale": w_qb_scale, "w_kv": w_kv, "gamma_kv": gamma_kv,
         "rope_cos": rope_cos, "rope_sin": rope_sin,
         "slot_indices": slot_indices, "kv_cache": kv_cache,
+        "rms_norm_eps": rms_norm_eps,
     }
 
 
-def _check_out(out, x):
+def _check_out(out, qr_out, x):
     import torch
     t = int(x.shape[0])
     if (tuple(out.shape) != (t, HEADS, HEAD_DIM)
             or out.dtype != torch.bfloat16 or out.device != x.device):
         raise ValueError(
             "q_output must be bfloat16 [T,64,512] on the input device")
+    if (tuple(qr_out.shape) != (t, Q_LORA)
+            or qr_out.dtype != torch.bfloat16 or qr_out.device != x.device):
+        raise ValueError(
+            "qr must be bfloat16 [T,1280] on the input device")
 
 
 def _impl(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-          rope_cos, rope_sin, slot_indices, kv_cache, out=None,
-          *, backend=None, kernel_id=None):
+          rope_cos, rope_sin, slot_indices, kv_cache, out=None, qr_out=None,
+          *, rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None, kernel_id=None):
     """Eager dispatch shared by the functional and out torch declarations."""
     from flashinfer.operators.runtime import allocate_output
     from flashinfer.runtime import build_signature, current_hardware, dispatch
@@ -197,59 +223,63 @@ def _impl(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
 
     arguments = _arguments(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-        rope_cos, rope_sin, slot_indices, kv_cache)
+        rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps)
     validate_values(arguments)
     invocation = infer(arguments, None)
     if out is None:
         out = allocate_output(invocation.outputs[0])
-    else:
-        _check_out(out, x)
-    tensors = invocation.inputs + (out,)
+    if qr_out is None:
+        qr_out = allocate_output(invocation.outputs[1])
+    _check_out(out, qr_out, x)
+    tensors = invocation.inputs + (out, qr_out)
     request = build_signature(
         OP, tensors, inference=invocation.inference,
         specializations={"tensor_contract": "supported"})
     decision = dispatch(
         request, current_hardware(), backend=backend, kernel_id=kernel_id)
-    run_selected(decision.kernel_id, *tensors)
-    return out
+    run_selected(decision.kernel_id, *tensors, **invocation.attributes)
+    return out, qr_out
 
 
 def _mla_prolog(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-                      rope_cos, rope_sin, slot_indices, kv_cache,
-                      *, backend=None, kernel_id=None):
+                rope_cos, rope_sin, slot_indices, kv_cache,
+                *, rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None, kernel_id=None):
     return _impl(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
         rope_cos, rope_sin, slot_indices, kv_cache,
-        backend=backend, kernel_id=kernel_id)
+        rms_norm_eps=rms_norm_eps, backend=backend, kernel_id=kernel_id)
 
 
 def _mla_prolog_out(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-                         rope_cos, rope_sin, slot_indices, kv_cache, q_output,
-                         *, backend=None, kernel_id=None):
+                    rope_cos, rope_sin, slot_indices, kv_cache, q_output, qr,
+                    *, rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None, kernel_id=None):
     _impl(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-        rope_cos, rope_sin, slot_indices, kv_cache, out=q_output,
-        backend=backend, kernel_id=kernel_id)
+        rope_cos, rope_sin, slot_indices, kv_cache, out=q_output, qr_out=qr,
+        rms_norm_eps=rms_norm_eps, backend=backend, kernel_id=kernel_id)
 
 
 def _mla_prolog_meta(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv,
-                           gamma_kv, rope_cos, rope_sin, slot_indices,
-                           kv_cache, *, backend=None, kernel_id=None):
+                     gamma_kv, rope_cos, rope_sin, slot_indices,
+                     kv_cache, *, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
+                     backend=None, kernel_id=None):
     import torch
     arguments = _arguments(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-        rope_cos, rope_sin, slot_indices, kv_cache)
+        rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps)
     invocation = infer(arguments, None)
-    specification = invocation.outputs[0]
-    return torch.empty(
-        specification.shape, dtype=getattr(torch, specification.dtype),
-        device=x.device)
+    return tuple(
+        torch.empty(specification.shape,
+                    dtype=getattr(torch, specification.dtype), device=x.device)
+        for specification in invocation.outputs)
 
 
 def _mla_prolog_out_meta(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv,
-                               gamma_kv, rope_cos, rope_sin, slot_indices,
-                               kv_cache, q_output, *, backend=None, kernel_id=None):
-    _check_out(q_output, x)
+                         gamma_kv, rope_cos, rope_sin, slot_indices,
+                         kv_cache, q_output, qr, *,
+                         rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None,
+                         kernel_id=None):
+    _check_out(q_output, qr, x)
     return None
 
 
@@ -262,21 +292,23 @@ def torch_declarations():
         "Tensor w_qb_scale, Tensor w_kv, Tensor gamma_kv, Tensor rope_cos, "
         "Tensor rope_sin, Tensor slot_indices, Tensor(a!) kv_cache"
     )
-    options = "*, str? backend=None, str? kernel_id=None"
+    options = ("*, float rms_norm_eps=1e-6, str? backend=None, "
+               "str? kernel_id=None")
     return (
         AscendCOp(
             "flashinfer::mla_prolog",
-            "(%s, %s) -> Tensor" % (inputs, options),
+            "(%s, %s) -> (Tensor, Tensor)" % (inputs, options),
             _mla_prolog,
             _mla_prolog_meta,
             ("kv_cache",),
         ),
         AscendCOp(
             "flashinfer::mla_prolog_out",
-            "(%s, Tensor(b!) q_output, %s) -> ()" % (inputs, options),
+            "(%s, Tensor(b!) q_output, Tensor(c!) qr, %s) -> ()"
+            % (inputs, options),
             _mla_prolog_out,
             _mla_prolog_out_meta,
-            ("kv_cache", "q_output"),
+            ("kv_cache", "q_output", "qr"),
         ),
     )
 
@@ -291,11 +323,13 @@ OPERATOR = OperatorDefinition(
     validate_values=validate_values,
     description=(
         "DS4.1 MLA prolog fusion with fixed H=5120, Q_LORA=1280, KV_LORA=512, "
-        "N=64, D_NOPE=448 and D_ROPE=64. Writes q_output[T,64,512] and updates "
-        "the addressed kv_cache rows in place; unaddressed rows are sentinels. "
-        "BF16 materialization points and INT8 dynamic quantization are frozen. "
-        "T is in [1,4096] and each call is one launch. The public torch "
-        "declaration lists kv_cache as a mutated argument. Graph capture is "
-        "not declared."
+        "N=64, D_NOPE=448 and D_ROPE=64. Returns q_output[T,64,512] and the "
+        "required qr[T,1280] = q_norm(wq_a(x)), and updates the addressed "
+        "kv_cache rows in place; unaddressed rows are sentinels. "
+        "rms_norm_eps (default 1e-6) parameterizes both RMSNorm branches and "
+        "must be finite and > 0. BF16 materialization points and INT8 dynamic "
+        "quantization are frozen. T is in [1,4096] and each call is one "
+        "launch. The public torch declaration lists kv_cache as a mutated "
+        "argument. Graph capture is not declared."
     ),
 )

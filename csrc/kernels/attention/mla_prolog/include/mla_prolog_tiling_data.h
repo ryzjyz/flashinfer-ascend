@@ -23,11 +23,17 @@
 #include <cstdint>
 
 struct MlaPrologTilingData {
+    // Layout version 2 adds the rms_norm_eps attribute scalar. The device
+    // entry rejects any other version so a stale host/device pair cannot
+    // misinterpret the payload.
     uint32_t version;
     uint32_t t;
     uint32_t aicNum;
     uint32_t projectionSplits;
     uint32_t narrowM;
+    // FP32 RMSNorm epsilon parsed from the rms_norm_eps OpDef attribute;
+    // applied to both the Q and KV branches. Always finite and > 0.
+    float rmsNormEps;
     uint32_t qaOffset;
     uint32_t qaBytes;
     uint32_t kvOffset;

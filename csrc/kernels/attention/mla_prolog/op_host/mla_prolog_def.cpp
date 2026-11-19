@@ -76,7 +76,16 @@ public:
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16})
             .Format({ge::FORMAT_ND});
+        // Host tiling parses this attribute into the tiling payload; the
+        // kernel ABI forwards Tensor arguments plus workspace/tiling only.
+        // 1e-6 preserves the frozen contract, DS4.1 callers may pass 1e-20.
+        this->Attr("rms_norm_eps").AttrType(OPTIONAL).Float(1e-6);
         this->Output("q_output")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_BF16})
+            .Format({ge::FORMAT_ND});
+        // Required second output: BF16 q_norm(wq_a(x)), [t,1280] ND.
+        this->Output("qr")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16})
             .Format({ge::FORMAT_ND});

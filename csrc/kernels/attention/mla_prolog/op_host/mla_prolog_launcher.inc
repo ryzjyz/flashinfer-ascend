@@ -17,7 +17,13 @@
  * the original host launcher from the standalone source (SHA256 443d75c7...).
  * The GetDsv41MlaPrologWorkspaceSize / Dsv41MlaProlog symbol names are frozen
  * standalone ABI implementation details, not the public repo operator name.
+ * The required qr output and the rmsNormEps scalar mirror the op-package
+ * contract; in the op-package path rmsNormEps reaches the kernel through the
+ * host tiling payload because CANN kernel entries receive Tensor arguments
+ * plus workspace/tiling only.
  */
+
+#include <cmath>
 
 uint64_t GetDsv41MlaPrologWorkspaceSize(const Dsv41MlaPrologArguments &args)
 {
@@ -40,6 +46,8 @@ aclError Dsv41MlaProlog(
         args.wQb == nullptr || args.wQbScale == nullptr || args.wKv == nullptr ||
         args.gammaKv == nullptr || args.ropeCos == nullptr || args.ropeSin == nullptr ||
         args.slotIndices == nullptr || args.kvCache == nullptr || args.qOutput == nullptr ||
+        args.qr == nullptr || !std::isfinite(args.rmsNormEps) ||
+        !(args.rmsNormEps > 0.0F) ||
         args.workspace == nullptr || stream == nullptr || args.t <= 0 ||
         args.t > static_cast<int32_t>(Dsv41::kMaxT)) {
         return ACL_ERROR_INVALID_PARAM;
@@ -105,7 +113,9 @@ aclError Dsv41MlaProlog(
         reinterpret_cast<uint8_t *>(const_cast<uint16_t *>(args.wQbScale)),
         wScaleFp,
         static_cast<uint32_t>(args.t),
-        projectionSplits};
+        projectionSplits,
+        reinterpret_cast<uint8_t *>(args.qr),
+        args.rmsNormEps};
     const GemmCoord quantShape(static_cast<uint32_t>(args.t), Dsv41::kQbOut, Dsv41::kQa);
     Dsv41::QuantMatmul::Arguments quantArgs{
         quantShape,

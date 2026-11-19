@@ -18,6 +18,7 @@
  */
 
 #include <acl/acl_rt.h>
+#include <cmath>
 #include "register/op_impl_registry.h"
 #include "fi_host_checks.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -25,6 +26,9 @@
 
 namespace optiling {
 namespace {
+constexpr uint32_t kVersion = 2;
+constexpr size_t kRmsNormEpsAttrIndex = 0;
+constexpr float kDefaultRmsNormEps = 1.0e-6F;
 constexpr uint32_t kHidden = 5120;
 constexpr uint32_t kQa = 1280;
 constexpr uint32_t kKv = 512;
@@ -94,6 +98,21 @@ ge::graphStatus MlaPrologTiling(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
 
+    // rms_norm_eps is an OpDef attribute; optional callers get the 1e-6
+    // default materialized by the framework. Validate before any launch.
+    float rmsNormEps = kDefaultRmsNormEps;
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        const float *eps = attrs->GetAttrPointer<float>(kRmsNormEpsAttrIndex);
+        if (eps != nullptr) {
+            rmsNormEps = *eps;
+        }
+    }
+    if (!std::isfinite(rmsNormEps) || !(rmsNormEps > 0.0F)) {
+        OP_LOGE(context->GetNodeName(), "rms_norm_eps must be finite and > 0");
+        return ge::GRAPH_FAILED;
+    }
+
     uint32_t projectionSplits = 1;
     uint32_t narrowM = 0;
     if (t <= kSplitProjectionMaxT) {
@@ -107,11 +126,12 @@ ge::graphStatus MlaPrologTiling(gert::TilingContext *context)
     MlaPrologTilingData *data = context->GetTilingData<MlaPrologTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, data);
     *data = {};
-    data->version = 1;
+    data->version = kVersion;
     data->t = static_cast<uint32_t>(t);
     data->aicNum = aicNum;
     data->projectionSplits = projectionSplits;
     data->narrowM = narrowM;
+    data->rmsNormEps = rmsNormEps;
     data->qaOffset = 0;
     data->qaBytes = Align512(static_cast<uint64_t>(kMaxProjectionSplits) * t * kQa * sizeof(float));
     data->kvOffset = data->qaOffset + data->qaBytes;

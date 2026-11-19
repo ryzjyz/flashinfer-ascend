@@ -4,6 +4,8 @@ This file mirrors the frozen BF16 materialization points of the standalone
 reference used during evolution: every public BF16 ingress, each GEMM output,
 RMSNorm output, dequantized INT8 GEMM output and each RoPE pair is rounded to
 BF16. The cache update is an exact scatter of the computed 512-value rows.
+``qr`` is the same BF16 RMSNorm row that feeds dynamic quantization, and
+``rms_norm_eps`` parameterizes both RMSNorm branches (default ``1e-6``).
 
 The public KV cache is ``[22594, 128, 512]`` BF16 (about 2.76 GiB). Samples
 allocate it directly on the NPU; the CPU oracle never materializes the dense
@@ -60,11 +62,11 @@ def _matmul_bf16(torch, left, right_rows):
     return bf16_round(torch, result)
 
 
-def _rms_norm_bf16(torch, value, gamma):
+def _rms_norm_bf16(torch, value, gamma, epsilon=1.0e-6):
     value = value.to(torch.float32)
     gamma = gamma.to(torch.float32)
     mean_square = (value * value).sum(dim=-1, dtype=torch.float32) / value.shape[-1]
-    reciprocal_rms = 1.0 / torch.sqrt(mean_square + 1.0e-6)
+    reciprocal_rms = 1.0 / torch.sqrt(mean_square + float(epsilon))
     normalized = value * reciprocal_rms.unsqueeze(-1) * gamma
     if not bool(torch.isfinite(normalized).all()):
         raise ValueError("rms_norm result contains non-finite values")
@@ -122,7 +124,8 @@ def _partial_rope_bf16(torch, value, rope_cos, rope_sin):
     return result
 
 
-def golden_kv_updates(torch, x, w_kv, gamma_kv, rope_cos, rope_sin, *, row_chunk=8):
+def golden_kv_updates(torch, x, w_kv, gamma_kv, rope_cos, rope_sin, *,
+                      row_chunk=8, rms_norm_eps=1.0e-6):
     """Compute only the 512-value cache rows materialized by the call."""
     x = bf16_round(torch, _cpu_float(x))
     w_kv = bf16_round(torch, _cpu_float(w_kv))
@@ -133,15 +136,16 @@ def golden_kv_updates(torch, x, w_kv, gamma_kv, rope_cos, rope_sin, *, row_chunk
     for begin in range(0, t, row_chunk):
         end = min(begin + row_chunk, t)
         kv = _matmul_bf16(torch, x[begin:end], w_kv)
-        kv_norm = _rms_norm_bf16(torch, kv, gamma_kv)
+        kv_norm = _rms_norm_bf16(torch, kv, gamma_kv, rms_norm_eps)
         updates[begin:end] = _partial_rope_bf16(
             torch, kv_norm, rope_cos[begin:end], rope_sin[begin:end])
     return updates
 
 
 def golden(torch, x, w_qa, gamma_qa, w_qb_nz, w_qb_scale, w_kv, gamma_kv,
-           rope_cos, rope_sin, *, row_chunk=8, column_chunk=2048):
-    """Return ``(q_output, kv_updates)`` for the frozen nine-op chain.
+           rope_cos, rope_sin, *, row_chunk=8, column_chunk=2048,
+           rms_norm_eps=1.0e-6):
+    """Return ``(q_output, qr, kv_updates)`` for the frozen nine-op chain.
 
     ``kv_cache`` is not passed: the oracle returns the rows the kernel scatters
     and the caller applies them to the cache representation it owns.
@@ -159,12 +163,14 @@ def golden(torch, x, w_qa, gamma_qa, w_qb_nz, w_qb_scale, w_kv, gamma_kv,
         raise ValueError("T must be in [1, 4096]")
 
     q_output = torch.empty((t, HEADS, HEAD_DIM), dtype=torch.float32)
+    qr = torch.empty((t, Q_LORA), dtype=torch.float32)
     kv_updates = torch.empty((t, KV_LORA), dtype=torch.float32)
     for begin in range(0, t, row_chunk):
         end = min(begin + row_chunk, t)
         x_chunk = x[begin:end]
         qa = _matmul_bf16(torch, x_chunk, w_qa)
-        qa_norm = _rms_norm_bf16(torch, qa, gamma_qa)
+        qa_norm = _rms_norm_bf16(torch, qa, gamma_qa, rms_norm_eps)
+        qr[begin:end] = qa_norm
         qa_int8, qa_scale = _dynamic_quant(torch, qa_norm)
         q_raw = _quant_matmul_bf16(
             torch, qa_int8, w_qb, qa_scale, w_qb_scale, column_chunk,
@@ -173,10 +179,10 @@ def golden(torch, x, w_qa, gamma_qa, w_qb_nz, w_qb_scale, w_kv, gamma_kv,
             torch, q_raw, rope_cos[begin:end], rope_sin[begin:end])
 
         kv = _matmul_bf16(torch, x_chunk, w_kv)
-        kv_norm = _rms_norm_bf16(torch, kv, gamma_kv)
+        kv_norm = _rms_norm_bf16(torch, kv, gamma_kv, rms_norm_eps)
         kv_updates[begin:end] = _partial_rope_bf16(
             torch, kv_norm, rope_cos[begin:end], rope_sin[begin:end])
-    return q_output, kv_updates
+    return q_output, qr, kv_updates
 
 
 def sentinel_row(torch):
@@ -184,7 +190,7 @@ def sentinel_row(torch):
     return bf16_round(torch, values)
 
 
-def sample(torch, torch_npu, *, t=1):
+def sample(torch, torch_npu, *, t=1, rms_norm_eps=1.0e-6):
     """Deterministic A3 input. The dense cache is allocated on the NPU."""
     rng = torch.Generator().manual_seed(20261117 + int(t))
     dtype = torch.bfloat16
@@ -220,31 +226,38 @@ def sample(torch, torch_npu, *, t=1):
         torch_npu.npu_format_cast(w_qb.npu(), 29), nd(w_qb_scale),
         nd(w_kv), nd(gamma_kv), nd(rope_cos), nd(rope_sin), nd(slots), cache,
     )
-    expected = golden(
+    q_output, qr, _ = golden(
         torch, x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-        rope_cos, rope_sin,
-    )[0]
-    return args, {}, expected
+        rope_cos, rope_sin, rms_norm_eps=rms_norm_eps,
+    )
+    expected = (q_output, qr)
+    options = {} if float(rms_norm_eps) == 1.0e-6 else dict(
+        rms_norm_eps=float(rms_norm_eps))
+    return args, options, expected
 
 
 CASE_PARAMETERS = (
     dict(t=1),
     dict(t=96),
     dict(t=193),
+    # Exercise the keyword attribute end to end with the DS4.1 value.
+    dict(t=96, rms_norm_eps=1.0e-20),
 )
 # BF16 policy v2: matched ratio >= 0.999, atol/rtol = 0.0156, max_abs <= 1.0.
-# torch.testing.assert_close consumes the (atol, rtol) pair per output.
-TOLERANCES = ((0.0156, 0.0156),)
+# torch.testing.assert_close consumes the (atol, rtol) pair per output; the
+# tuple follows OUTPUT_NAMES (q_output, qr).
+TOLERANCES = ((0.0156, 0.0156), (0.0156, 0.0156))
 
 
 def verify_effect(torch, call, args, options, outputs):
-    """Check the in-place cache effect that the single output cannot express."""
+    """Check the in-place cache effect the fresh outputs cannot express."""
     (cache,) = (args[-1],)
     slots = args[-2].detach().to(cache.device).long()
     sentinel = cache[SENTINEL_PAGE, SENTINEL_ROW].detach().to("cpu", torch.float32)
     if not torch.equal(sentinel, sentinel_row(torch)):
         raise AssertionError("kv_cache sentinel row was modified")
     updates = golden_kv_updates(
-        torch, args[0], args[5], args[6], args[7], args[8])
+        torch, args[0], args[5], args[6], args[7], args[8],
+        rms_norm_eps=float(options.get("rms_norm_eps", 1.0e-6)))
     actual = cache[slots[:, 0], slots[:, 1]].detach().to("cpu", torch.float32)
     torch.testing.assert_close(actual, updates, atol=0.0156, rtol=0.0156)
