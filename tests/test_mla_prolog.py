@@ -8,7 +8,8 @@ from flashinfer.operators.attention.mla_prolog import cases
 from flashinfer.operators.attention.mla_prolog.operator import (
     CACHE_PAGES, CACHE_ROWS, DEFAULT_HEAD_NUM, HEAD_DIM, HIDDEN, KV_LORA,
     MAX_HEAD_NUM, OPERATOR, Q_LORA, RMS_NORM_EPS_DEFAULT, ROPE_DIM,
-    q_out_dim, torch_declarations, validate_values, w_qb_nz_shape,
+    UPDATE_KV_CACHE_DEFAULT, infer, q_out_dim, torch_declarations,
+    validate_values, w_qb_nz_shape,
 )
 from flashinfer.operators.runtime import fake
 
@@ -20,7 +21,8 @@ def meta(shape, dtype):
 
 
 def arguments(t=1, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
-              q_head_num=DEFAULT_HEAD_NUM):
+              q_head_num=DEFAULT_HEAD_NUM,
+              update_kv_cache=UPDATE_KV_CACHE_DEFAULT):
     return {
         "x": meta((t, HIDDEN), torch.bfloat16),
         "w_qa": meta((Q_LORA, HIDDEN), torch.bfloat16),
@@ -35,6 +37,7 @@ def arguments(t=1, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
         "kv_cache": meta((CACHE_PAGES, CACHE_ROWS, KV_LORA), torch.bfloat16),
         "rms_norm_eps": rms_norm_eps,
         "q_head_num": q_head_num,
+        "update_kv_cache": update_kv_cache,
     }
 
 
@@ -42,33 +45,116 @@ def test_public_entry_and_metadata_only_fake():
     import flashinfer.attention.mla_prolog as module
 
     assert OPERATOR.public_entry == "flashinfer.attention.mla_prolog:mla_prolog"
-    assert OPERATOR.output_names == ("q_output", "qr")
+    assert OPERATOR.output_names == ("q_output", "qr", "kv")
     assert inspect.signature(module.mla_prolog) == OPERATOR.public_signature
     parameters = inspect.signature(module.mla_prolog).parameters
     assert parameters["rms_norm_eps"].default == RMS_NORM_EPS_DEFAULT
     assert parameters["q_head_num"].default == DEFAULT_HEAD_NUM == 64
+    assert parameters["update_kv_cache"].default is UPDATE_KV_CACHE_DEFAULT
+    assert parameters["update_kv_cache"].default is True
     assert parameters["qr_out"].default is None
+    assert parameters["kv_out"].default is None
     outputs = fake(OPERATOR.op, arguments(3))
-    assert isinstance(outputs, tuple) and len(outputs) == 2
-    q_output, qr = outputs
+    assert isinstance(outputs, tuple) and len(outputs) == 3
+    q_output, qr, kv = outputs
     assert q_output.shape == (3, DEFAULT_HEAD_NUM, HEAD_DIM)
     assert q_output.dtype == torch.bfloat16
     assert q_output.device.type == "meta"
     assert qr.shape == (3, Q_LORA)
     assert qr.dtype == torch.bfloat16
     assert qr.device.type == "meta"
+    # kv is declared in both modes; the fused kernel leaves it unwritten.
+    assert kv.shape == (3, KV_LORA)
+    assert kv.dtype == torch.bfloat16
+    assert kv.device.type == "meta"
 
 
 def test_q_head_num_drives_only_the_q_output_shape():
     for q_head_num in HEAD_NUM_CASES:
-        q_output, qr = fake(OPERATOR.op, arguments(2, q_head_num=q_head_num))
+        q_output, qr, kv = fake(OPERATOR.op, arguments(2, q_head_num=q_head_num))
         assert q_output.shape == (2, q_head_num, HEAD_DIM)
         assert q_output.dtype == torch.bfloat16
         assert q_output.device.type == "meta"
         # qr is Q-LoRA normalization and is never sharded by head count.
         assert qr.shape == (2, Q_LORA)
         assert qr.dtype == torch.bfloat16
+        # kv is never sharded by head count either.
+        assert kv.shape == (2, KV_LORA)
+        assert kv.dtype == torch.bfloat16
     assert MAX_HEAD_NUM == 64
+
+
+def test_update_kv_cache_selects_the_public_return_contract():
+    for q_head_num in HEAD_NUM_CASES:
+        invocation = infer(arguments(2, q_head_num=q_head_num,
+                                     update_kv_cache=False), None)
+        assert [spec.shape for spec in invocation.outputs] == [
+            (2, q_head_num, HEAD_DIM), (2, Q_LORA), (2, KV_LORA)]
+        assert invocation.attributes["update_kv_cache"] is False
+    fused = infer(arguments(2), None)
+    assert fused.attributes["update_kv_cache"] is True
+    assert len(fused.outputs) == len(OPERATOR.output_names) == 3
+    # The public facade returns the pair in fused mode and the triple in
+    # diagnostic mode; cases encodes the same per-case count.
+    assert cases.output_count({}) == 2
+    assert cases.output_count({"update_kv_cache": True}) == 2
+    assert cases.output_count({"update_kv_cache": False}) == 3
+
+
+def test_public_result_is_the_pair_in_fused_mode_and_triple_otherwise():
+    import flashinfer.attention.mla_prolog as module
+
+    outputs = ("q_output", "qr", "kv")
+    assert module._public_result(outputs, True) == ("q_output", "qr")
+    assert module._public_result(outputs, False) == (
+        "q_output", "qr", "kv")
+    for value in (0, 1, "true", None):
+        try:
+            module._public_result(outputs, value)
+        except ValueError:
+            continue
+        raise AssertionError("non-bool update_kv_cache was accepted: " + repr(value))
+    try:
+        module._public_result(outputs[:2], True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a short native output list was accepted")
+
+
+def test_invalid_update_kv_cache_is_rejected_before_dispatch():
+    for value in (0, 1, "false", None, 1.0):
+        values = arguments(1)
+        values["update_kv_cache"] = value
+        try:
+            fake(OPERATOR.op, values)
+        except ValueError:
+            continue
+        raise AssertionError("invalid update_kv_cache was accepted: " + repr(value))
+
+
+def test_validate_values_ignores_slots_only_when_cache_is_disabled():
+    def values(update):
+        result = arguments(2, update_kv_cache=update)
+        result.update(
+            # Duplicate addresses that the fused scatter rejects.
+            slot_indices=torch.tensor([[0, 0], [0, 0]], dtype=torch.int32),
+            rope_cos=torch.ones(2, 1, 1, ROPE_DIM),
+            rope_sin=torch.zeros(2, 1, 1, ROPE_DIM),
+            w_qb_scale=torch.ones(q_out_dim(), dtype=torch.bfloat16),
+            gamma_qa=torch.ones(Q_LORA, dtype=torch.bfloat16),
+            gamma_kv=torch.ones(KV_LORA, dtype=torch.bfloat16),
+        )
+        return result
+
+    try:
+        validate_values(values(True))
+    except ValueError as error:
+        assert "unique" in str(error)
+    else:
+        raise AssertionError("duplicate slot_indices were accepted in fused mode")
+    # slot_indices is ignored (never read) when the cache is not updated.
+    validate_values(values(False))
 
 
 def test_invalid_q_head_num_is_rejected_before_dispatch():
@@ -120,20 +206,29 @@ def test_torch_declarations_declare_kv_cache_mutation():
         }
         assert mutated == set(declaration.mutates_args)
     assert declarations[0].mutates_args == ("kv_cache",)
-    assert declarations[1].mutates_args == ("kv_cache", "q_output", "qr")
+    assert declarations[1].mutates_args == (
+        "kv_cache", "q_output", "qr", "kv")
     functional = torch._C.parse_schema(
         declarations[0].name + declarations[0].schema)
+    # The ACLNN output list is static: all three outputs are declared and the
+    # public facade truncates the fused mode to the legacy pair.
     assert [str(value.type) for value in functional.returns] == [
-        "Tensor", "Tensor"]
-    assert functional.arguments[-4].name == "rms_norm_eps"
-    assert functional.arguments[-4].default_value == 1e-6
-    assert functional.arguments[-3].name == "q_head_num"
-    assert functional.arguments[-3].default_value == 64
-    assert str(functional.arguments[-3].type) == "int"
+        "Tensor", "Tensor", "Tensor"]
+    assert functional.arguments[-5].name == "rms_norm_eps"
+    assert functional.arguments[-5].default_value == 1e-6
+    assert functional.arguments[-4].name == "q_head_num"
+    assert functional.arguments[-4].default_value == 64
+    assert str(functional.arguments[-4].type) == "int"
+    assert functional.arguments[-3].name == "update_kv_cache"
+    assert functional.arguments[-3].default_value is True
+    assert str(functional.arguments[-3].type) == "bool"
     out_schema = torch._C.parse_schema(
         declarations[1].name + declarations[1].schema)
-    assert out_schema.arguments[-3].name == "q_head_num"
-    assert out_schema.arguments[-3].default_value == 64
+    assert out_schema.arguments[-5].name == "rms_norm_eps"
+    assert out_schema.arguments[-4].name == "q_head_num"
+    assert out_schema.arguments[-4].default_value == 64
+    assert out_schema.arguments[-3].name == "update_kv_cache"
+    assert out_schema.arguments[-3].default_value is True
 
 
 def test_invalid_metadata_is_rejected_before_dispatch():
@@ -261,14 +356,30 @@ def test_cpu_golden_q_head_num_shapes_and_qr_independence():
             q_output, q_output64[:, :head_num, :], atol=0.0, rtol=0.0)
 
 
-def test_case_parameters_cover_q_head_num_boundaries():
+def test_case_parameters_cover_q_head_num_boundaries_and_both_modes():
     heads = {case.get("q_head_num", DEFAULT_HEAD_NUM)
              for case in cases.CASE_PARAMETERS}
     assert set(HEAD_NUM_CASES) <= heads
-    assert len(cases.TOLERANCES) == len(OPERATOR.output_names) == 2
+    assert len(cases.TOLERANCES) == len(OPERATOR.output_names) == 3
+    modes = {case.get("update_kv_cache", True) for case in cases.CASE_PARAMETERS}
+    assert modes == {True, False}
+    # Both modes are exercised at both T boundaries for every head count.
+    covered = {
+        (case.get("q_head_num", DEFAULT_HEAD_NUM),
+         case["t"], case.get("update_kv_cache", True))
+        for case in cases.CASE_PARAMETERS
+    }
+    for head_num in HEAD_NUM_CASES:
+        for t in (1, 96):
+            for update in (True, False):
+                assert (head_num, t, update) in covered, (
+                    head_num, t, update)
 
 
 def test_case_tolerances_match_outputs():
     assert len(cases.CASE_PARAMETERS) >= 1
-    assert len(cases.TOLERANCES) == len(OPERATOR.output_names) == 2
+    assert len(cases.TOLERANCES) == len(OPERATOR.output_names) == 3
     assert any("rms_norm_eps" in case for case in cases.CASE_PARAMETERS)
+    for case in cases.CASE_PARAMETERS:
+        assert cases.output_count(case) == (
+            2 if case.get("update_kv_cache", True) else 3)

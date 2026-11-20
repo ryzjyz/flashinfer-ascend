@@ -26,11 +26,13 @@
 
 namespace optiling {
 namespace {
-constexpr uint32_t kVersion = 3;
+constexpr uint32_t kVersion = 4;
 constexpr size_t kRmsNormEpsAttrIndex = 0;
 constexpr size_t kHeadNumAttrIndex = 1;
+constexpr size_t kUpdateKvCacheAttrIndex = 2;
 constexpr float kDefaultRmsNormEps = 1.0e-6F;
 constexpr int64_t kDefaultHeadNum = 64;
+constexpr bool kDefaultUpdateKvCache = true;
 constexpr uint32_t kHidden = 5120;
 constexpr uint32_t kQa = 1280;
 constexpr uint32_t kKv = 512;
@@ -83,10 +85,12 @@ ge::graphStatus MlaPrologTiling(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
 
-    // rms_norm_eps and q_head_num are OpDef attributes; optional callers get
-    // the framework-materialized defaults. Validate both before any launch.
+    // rms_norm_eps, q_head_num and update_kv_cache are OpDef attributes;
+    // optional callers get the framework-materialized defaults. Validate them
+    // before any launch.
     float rmsNormEps = kDefaultRmsNormEps;
     int64_t headNumAttr = kDefaultHeadNum;
+    bool updateKvCache = kDefaultUpdateKvCache;
     auto attrs = context->GetAttrs();
     if (attrs != nullptr) {
         const float *eps = attrs->GetAttrPointer<float>(kRmsNormEpsAttrIndex);
@@ -97,6 +101,11 @@ ge::graphStatus MlaPrologTiling(gert::TilingContext *context)
             attrs->GetAttrPointer<int64_t>(kHeadNumAttrIndex);
         if (heads != nullptr) {
             headNumAttr = *heads;
+        }
+        const bool *update =
+            attrs->GetAttrPointer<bool>(kUpdateKvCacheAttrIndex);
+        if (update != nullptr) {
+            updateKvCache = *update;
         }
     }
     if (!std::isfinite(rmsNormEps) || !(rmsNormEps > 0.0F)) {
@@ -156,6 +165,19 @@ ge::graphStatus MlaPrologTiling(gert::TilingContext *context)
             return ge::GRAPH_FAILED;
         }
     }
+    // The kv output is always declared [T, 512]. With update_kv_cache=true the
+    // kernel leaves it untouched (no fused-path GM write); with false it is
+    // the only KV write target.
+    const gert::StorageShape *kvOutShape = context->GetOutputShape(2);
+    if (kvOutShape != nullptr) {
+        const auto &kvDims = kvOutShape->GetStorageShape();
+        if (kvDims.GetDimNum() != 2 || kvDims.GetDim(0) != t ||
+            kvDims.GetDim(1) != static_cast<int64_t>(kKv)) {
+            OP_LOGE(context->GetNodeName(),
+                    "kv must have shape [T, 512]");
+            return ge::GRAPH_FAILED;
+        }
+    }
 
     platform_ascendc::PlatformAscendC platform(context->GetPlatformInfo());
     const uint32_t aicNum = platform.GetCoreNumAic();
@@ -189,6 +211,7 @@ ge::graphStatus MlaPrologTiling(gert::TilingContext *context)
     data->projectionSplits = projectionSplits;
     data->narrowM = narrowM;
     data->headNum = headNum;
+    data->updateKvCache = updateKvCache ? 1U : 0U;
     data->rmsNormEps = rmsNormEps;
     data->qaOffset = 0;
     data->qaBytes = Align512(static_cast<uint64_t>(kMaxProjectionSplits) * t * kQa * sizeof(float));

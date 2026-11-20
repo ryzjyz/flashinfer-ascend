@@ -48,7 +48,10 @@ aclError Dsv41MlaProlog(
     if (args.x == nullptr || args.wQa == nullptr || args.gammaQa == nullptr ||
         args.wQb == nullptr || args.wQbScale == nullptr || args.wKv == nullptr ||
         args.gammaKv == nullptr || args.ropeCos == nullptr || args.ropeSin == nullptr ||
-        args.slotIndices == nullptr || args.kvCache == nullptr || args.qOutput == nullptr ||
+        (args.updateKvCache
+             ? args.slotIndices == nullptr || args.kvCache == nullptr
+             : args.kvOut == nullptr) ||
+        args.qOutput == nullptr ||
         args.qr == nullptr || !std::isfinite(args.rmsNormEps) ||
         !(args.rmsNormEps > 0.0F) ||
         args.headNum < static_cast<int32_t>(Dsv41::kMinHeads) ||
@@ -141,7 +144,9 @@ aclError Dsv41MlaProlog(
         reinterpret_cast<uint8_t *>(const_cast<int32_t *>(args.slotIndices)),
         reinterpret_cast<uint8_t *>(args.kvCache),
         static_cast<uint32_t>(args.t),
-        headNum};
+        headNum,
+        args.updateKvCache,
+        reinterpret_cast<uint8_t *>(args.kvOut)};
     Dsv41::UnifiedMlaPrologKernel::Arguments unifiedArgs{
         projectionArgs,
         normArgs,

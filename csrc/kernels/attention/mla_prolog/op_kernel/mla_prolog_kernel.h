@@ -854,13 +854,23 @@ struct RopeScatterKernel {
         uint32_t t;
         // Local Q head count: qOutput is [t, headNum, kHeadDim].
         uint32_t headNum;
+        // true (default): scatter the computed row into `cache` at the row
+        // named by `slots` (fused behavior; `kvOut` is never written).
+        // false: write the same [t,kHeadDim] BF16 row to the fresh `kvOut`
+        // output and NEVER read `slots` or read/write `cache`. The Q branch is
+        // unchanged in both modes.
+        bool updateKvCache;
+        GM_ADDR kvOut;
     };
     using Arguments = Params;
 
     static bool CanImplement(const Arguments &args)
     {
         return args.qOutput != nullptr && args.kv != nullptr && args.ropeCos != nullptr &&
-            args.ropeSin != nullptr && args.slots != nullptr && args.cache != nullptr &&
+            args.ropeSin != nullptr &&
+            (args.updateKvCache
+                 ? args.slots != nullptr && args.cache != nullptr
+                 : args.kvOut != nullptr) &&
             args.t > 0 && args.t <= kMaxT &&
             args.headNum >= kMinHeads && args.headNum <= kMaxHeads;
     }
@@ -931,12 +941,20 @@ struct RopeScatterKernel {
         AscendC::GlobalTensor<float> gmSin;
         AscendC::GlobalTensor<int32_t> gmSlots;
         AscendC::GlobalTensor<bfloat16_t> gmCache;
+        AscendC::GlobalTensor<bfloat16_t> gmKvOut;
         gmQ.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.qOutput));
         gmKv.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.kv));
         gmCos.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.ropeCos));
         gmSin.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.ropeSin));
-        gmSlots.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.slots));
-        gmCache.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.cache));
+        if (params.updateKvCache) {
+            // Fused mode: `slots`/`cache` are the only KV write target.
+            gmSlots.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.slots));
+            gmCache.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.cache));
+        } else {
+            // Diagnostic mode: `slots`/`cache` are never bound, so neither the
+            // slot scalars nor any cache row can be read or written.
+            gmKvOut.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.kvOut));
+        }
 
         auto *pipe = GetTPipePtr();
         const int32_t inputReady[2] = {
@@ -1049,15 +1067,22 @@ struct RopeScatterKernel {
                 AscendC::RoundMode::CAST_RINT, kRopeDim);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vMte3);
-            const int32_t page =
-                gmSlots.GetValue(static_cast<uint64_t>(token) * 2U);
-            const int32_t row =
-                gmSlots.GetValue(static_cast<uint64_t>(token) * 2U + 1U);
-            const uint64_t cacheRow =
-                static_cast<uint64_t>(page) * kCacheRowsPerPage +
-                static_cast<uint32_t>(row);
-            AscendC::DataCopy(
-                gmCache[cacheRow * kHeadDim], rowLocal[kvSlot], kHeadDim);
+            if (params.updateKvCache) {
+                const int32_t page =
+                    gmSlots.GetValue(static_cast<uint64_t>(token) * 2U);
+                const int32_t row =
+                    gmSlots.GetValue(static_cast<uint64_t>(token) * 2U + 1U);
+                const uint64_t cacheRow =
+                    static_cast<uint64_t>(page) * kCacheRowsPerPage +
+                    static_cast<uint32_t>(row);
+                AscendC::DataCopy(
+                    gmCache[cacheRow * kHeadDim], rowLocal[kvSlot], kHeadDim);
+            } else {
+                // Same bytes the fused path scatters into the cache row,
+                // written to the fresh [t, kHeadDim] output instead. No slot
+                // read and no cache access happen in this branch.
+                AscendC::DataCopy(gmKvOut[kvOffset], rowLocal[kvSlot], kHeadDim);
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(slotFree[kvSlot]);
             pending[kvSlot] = true;
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vMte2);

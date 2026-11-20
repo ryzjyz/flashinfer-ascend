@@ -22,12 +22,14 @@ namespace ops {
 constexpr size_t X_INPUT_INDEX = 0;
 constexpr size_t Q_OUTPUT_INDEX = 0;
 constexpr size_t QR_OUTPUT_INDEX = 1;
+constexpr size_t KV_OUTPUT_INDEX = 2;
 constexpr size_t HEAD_NUM_ATTR_INDEX = 1;
 constexpr int64_t DEFAULT_HEAD_NUM = 64;
 constexpr int64_t MIN_HEAD_NUM = 1;
 constexpr int64_t MAX_HEAD_NUM = 64;
 constexpr uint32_t HEAD_DIM = 512;
 constexpr uint32_t Q_LORA = 1280;
+constexpr uint32_t KV_LORA = 512;
 
 ge::graphStatus InferShapeMlaProlog(gert::InferShapeContext *context)
 {
@@ -63,6 +65,14 @@ ge::graphStatus InferShapeMlaProlog(gert::InferShapeContext *context)
     qrShape->SetDimNum(2);
     qrShape->SetDim(0, xShape->GetDim(0));
     qrShape->SetDim(1, Q_LORA);
+    // kv is the [T, 512] row the fused path writes into kv_cache. It is
+    // declared in both modes; with update_kv_cache=true the kernel does not
+    // write it, with false it is the only KV write target.
+    gert::Shape *kvShape = context->GetOutputShape(KV_OUTPUT_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, kvShape);
+    kvShape->SetDimNum(2);
+    kvShape->SetDim(0, xShape->GetDim(0));
+    kvShape->SetDim(1, KV_LORA);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -71,6 +81,7 @@ ge::graphStatus InferDataTypeMlaProlog(gert::InferDataTypeContext *context)
     OP_CHECK_NULL_WITH_CONTEXT(context, context);
     context->SetOutputDataType(Q_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
     context->SetOutputDataType(QR_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
+    context->SetOutputDataType(KV_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
     return ge::GRAPH_SUCCESS;
 }
 

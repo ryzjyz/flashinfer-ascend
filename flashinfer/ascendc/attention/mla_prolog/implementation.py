@@ -24,6 +24,7 @@ from flashinfer.operators.attention.mla_prolog.operator import (
     RMS_NORM_EPS_DEFAULT,
     RMS_NORM_EPS_MAXIMUM,
     RMS_NORM_EPS_MINIMUM,
+    UPDATE_KV_CACHE_DEFAULT,
 )
 from flashinfer.operators.author_api import Support
 from flashinfer.runtime import CapabilityCase, FeatureConstraint, ShapeRange
@@ -39,11 +40,12 @@ from .runner import make_runner
 KERNEL_ID = "ascendc/attention/mla_prolog/catlass/op_package/Ascend910C"
 OP = "attention.mla_prolog"
 
-# Inputs followed by the two fresh outputs (q_output, qr), in NativeBinding order.
+# Inputs followed by the three fresh outputs (q_output, qr, kv), in
+# NativeBinding order.
 DTYPE_SIGNATURE = (
     "bfloat16", "bfloat16", "bfloat16", "int8", "bfloat16", "bfloat16",
     "bfloat16", "float32", "float32", "int32", "bfloat16", "bfloat16",
-    "bfloat16",
+    "bfloat16", "bfloat16",
 )
 
 
@@ -69,6 +71,8 @@ IMPLEMENTATION = AscendCImplementation(
             ShapeRange(name="T", tensor_index=9, axis=0, minimum=1, maximum=4096),
             ShapeRange(name="T", tensor_index=11, axis=0, minimum=1, maximum=4096),
             ShapeRange(name="T", tensor_index=12, axis=0, minimum=1, maximum=4096),
+            # kv is [T,512] in both modes; the fused path leaves it unwritten.
+            ShapeRange(name="T", tensor_index=13, axis=0, minimum=1, maximum=4096),
             # Local Q head count for TP sharding (head_dim is fixed at 512).
             ShapeRange(name="q_head_num", tensor_index=11, axis=1,
                        minimum=MIN_HEAD_NUM, maximum=MAX_HEAD_NUM),
@@ -135,6 +139,10 @@ IMPLEMENTATION = AscendCImplementation(
             # Required second output: BF16 q_norm(wq_a(x)); the kernel writes
             # the same normBf16 row it already materializes for quantization.
             _tensor("qr", "output", "bfloat16", ("T", 1280)),
+            # BF16 [T,512] KV row. update_kv_cache=false stores the row here
+            # instead of scattering it into kv_cache; true leaves this fresh
+            # output unwritten (no GM store on the fused path).
+            _tensor("kv", "output", "bfloat16", ("T", 512)),
         ),
         dimensions=(
             ShapeConstraint(name="T", minimum=1, maximum=4096),
@@ -158,6 +166,12 @@ IMPLEMENTATION = AscendCImplementation(
             AttributeParameter(
                 "q_head_num", "int64", DEFAULT_HEAD_NUM,
                 MIN_HEAD_NUM, MAX_HEAD_NUM),
+            # true (default) keeps the fused kv_cache scatter; false writes the
+            # same row to the kv output and ignores kv_cache/slot_indices. The
+            # host tiler threads it through the tiling payload (no new kernel
+            # scalar argument). Order must match the OpDef Attr declaration.
+            AttributeParameter(
+                "update_kv_cache", "bool", UPDATE_KV_CACHE_DEFAULT),
         ),
     ),
     runner_factory=make_runner,

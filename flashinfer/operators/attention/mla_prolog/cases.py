@@ -3,7 +3,9 @@
 This file mirrors the frozen BF16 materialization points of the standalone
 reference used during evolution: every public BF16 ingress, each GEMM output,
 RMSNorm output, dequantized INT8 GEMM output and each RoPE pair is rounded to
-BF16. The cache update is an exact scatter of the computed 512-value rows.
+BF16. With ``update_kv_cache=True`` the cache update is an exact scatter of the
+computed 512-value rows; with ``update_kv_cache=False`` the same rows are
+returned as the fresh ``kv`` output and the cache is untouched.
 ``qr`` is the same BF16 RMSNorm row that feeds dynamic quantization, and
 ``rms_norm_eps`` parameterizes both RMSNorm branches (default ``1e-6``).
 
@@ -12,6 +14,11 @@ allocate it directly on the NPU; the CPU oracle never materializes the dense
 cache, it returns only the updated rows. Suites that cannot afford that device
 allocation must add a maintainer-approved reduced-cache test path rather than
 silently shrinking the public shape.
+
+The public entry returns ``(q_output, qr)`` in fused mode and
+``(q_output, qr, kv)`` in diagnostic mode. ``output_count`` tells the generic
+acceptance harness how many outputs a given case returns; ``TOLERANCES`` has
+one entry per declared output (q_output, qr, kv).
 """
 
 from .operator import (
@@ -195,14 +202,23 @@ def sentinel_row(torch):
     return bf16_round(torch, values)
 
 
+def output_count(configuration):
+    """Public output count for one case: 2 fused, 3 with the kv output."""
+    return 2 if configuration.get("update_kv_cache", True) else 3
+
+
 def sample(torch, torch_npu, *, t=1, rms_norm_eps=1.0e-6,
-           q_head_num=DEFAULT_HEAD_NUM):
+           q_head_num=DEFAULT_HEAD_NUM, update_kv_cache=True):
     """Deterministic A3 input. The dense cache is allocated on the NPU.
 
     ``q_head_num`` selects the local head count; ``w_qb``/``w_qb_scale`` are
     generated at ``q_head_num*512`` output channels. ``H=64`` reproduces the
-    frozen pre-sharding inputs bit for bit.
+    frozen pre-sharding inputs bit for bit. ``update_kv_cache=False`` keeps the
+    same inputs (slot_indices/cache are still passed but must be ignored) and
+    adds the oracle KV rows as the third expected output.
     """
+    if type(update_kv_cache) is not bool:
+        raise ValueError("update_kv_cache must be a bool")
     rng = torch.Generator().manual_seed(20261117 + int(t))
     dtype = torch.bfloat16
     q_out = q_out_dim(q_head_num)
@@ -238,13 +254,16 @@ def sample(torch, torch_npu, *, t=1, rms_norm_eps=1.0e-6,
         torch_npu.npu_format_cast(w_qb.npu(), 29), nd(w_qb_scale),
         nd(w_kv), nd(gamma_kv), nd(rope_cos), nd(rope_sin), nd(slots), cache,
     )
-    q_output, qr, _ = golden(
+    q_output, qr, kv_updates = golden(
         torch, x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
         rope_cos, rope_sin, rms_norm_eps=rms_norm_eps,
         q_head_num=q_head_num,
     )
-    expected = (q_output, qr)
-    options = {}
+    # The oracle rows are already BF16-rounded values; the diagnostic output
+    # is exactly these rows as BF16.
+    expected = (
+        (q_output, qr) if update_kv_cache else (q_output, qr, kv_updates))
+    options = {"update_kv_cache": bool(update_kv_cache)}
     if float(rms_norm_eps) != 1.0e-6:
         options["rms_norm_eps"] = float(rms_norm_eps)
     if int(q_head_num) != DEFAULT_HEAD_NUM:
@@ -268,15 +287,37 @@ CASE_PARAMETERS = (
     dict(t=1, q_head_num=63),
     dict(t=1, q_head_num=64),
     dict(t=96, q_head_num=1),
+    # update_kv_cache=False across the same head-count/T boundaries: the kv
+    # output must equal the fused cache rows and the cache must stay untouched.
+    dict(t=1, update_kv_cache=False),
+    dict(t=96, update_kv_cache=False),
+    dict(t=96, q_head_num=1, update_kv_cache=False),
+    dict(t=96, q_head_num=16, update_kv_cache=False),
+    dict(t=96, q_head_num=31, update_kv_cache=False),
+    dict(t=96, q_head_num=32, update_kv_cache=False),
+    dict(t=96, q_head_num=63, update_kv_cache=False),
+    dict(t=96, q_head_num=64, update_kv_cache=False),
+    dict(t=1, q_head_num=1, update_kv_cache=False),
+    dict(t=1, q_head_num=16, update_kv_cache=False),
+    dict(t=1, q_head_num=31, update_kv_cache=False),
+    dict(t=1, q_head_num=32, update_kv_cache=False),
+    dict(t=1, q_head_num=63, update_kv_cache=False),
+    dict(t=1, q_head_num=64, update_kv_cache=False),
+    # Fused mode with the remaining head counts at T=96 (the default H=64 is
+    # the plain t=96 case above).
+    dict(t=96, q_head_num=16),
+    dict(t=96, q_head_num=31),
+    dict(t=96, q_head_num=32),
+    dict(t=96, q_head_num=63),
 )
 # BF16 policy v2: matched ratio >= 0.999, atol/rtol = 0.0156, max_abs <= 1.0.
 # torch.testing.assert_close consumes the (atol, rtol) pair per output; the
-# tuple follows OUTPUT_NAMES (q_output, qr).
-TOLERANCES = ((0.0156, 0.0156), (0.0156, 0.0156))
+# tuple follows OUTPUT_NAMES (q_output, qr, kv). Fused cases use the first two.
+TOLERANCES = ((0.0156, 0.0156), (0.0156, 0.0156), (0.0156, 0.0156))
 
 
 def verify_effect(torch, call, args, options, outputs):
-    """Check the in-place cache effect the fresh outputs cannot express."""
+    """Check the cache/KV effect the fresh outputs cannot express."""
     (cache,) = (args[-1],)
     slots = args[-2].detach().to(cache.device).long()
     sentinel = cache[SENTINEL_PAGE, SENTINEL_ROW].detach().to("cpu", torch.float32)
@@ -285,5 +326,20 @@ def verify_effect(torch, call, args, options, outputs):
     updates = golden_kv_updates(
         torch, args[0], args[5], args[6], args[7], args[8],
         rms_norm_eps=float(options.get("rms_norm_eps", 1.0e-6)))
+    if options.get("update_kv_cache", True):
+        actual = cache[slots[:, 0], slots[:, 1]].detach().to("cpu", torch.float32)
+        torch.testing.assert_close(actual, updates, atol=0.0156, rtol=0.0156)
+        return
+    # Diagnostic mode: kv must be exactly the rows the fused path would have
+    # scattered, and kv_cache must still hold its pristine sample values (the
+    # sample allocates zeros and only the sentinel row is prefilled, so every
+    # addressed row is zero unless the kernel wrote it).
+    kv = outputs[2]
+    if tuple(kv.shape) != (int(args[0].shape[0]), KV_LORA):
+        raise AssertionError("kv output has shape %s" % (tuple(kv.shape),))
+    torch.testing.assert_close(
+        kv.detach().to("cpu", torch.float32), updates,
+        atol=0.0156, rtol=0.0156)
     actual = cache[slots[:, 0], slots[:, 1]].detach().to("cpu", torch.float32)
-    torch.testing.assert_close(actual, updates, atol=0.0156, rtol=0.0156)
+    if bool((actual != 0).any()):
+        raise AssertionError("kv_cache was modified with update_kv_cache=False")
