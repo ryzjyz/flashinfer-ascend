@@ -80,6 +80,10 @@ public:
         // kernel ABI forwards Tensor arguments plus workspace/tiling only.
         // 1e-6 preserves the frozen contract, DS4.1 callers may pass 1e-20.
         this->Attr("rms_norm_eps").AttrType(OPTIONAL).Float(1e-6);
+        // Local Q head count in [1,64] (default 64) for TP sharding. Host
+        // tiling validates it and threads it through the tiling payload; the
+        // kernel ABI gains no new scalar parameter.
+        this->Attr("q_head_num").AttrType(OPTIONAL).Int(64);
         this->Output("q_output")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16})

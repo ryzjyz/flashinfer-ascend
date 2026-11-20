@@ -6,24 +6,27 @@ import torch
 
 from flashinfer.operators.attention.mla_prolog import cases
 from flashinfer.operators.attention.mla_prolog.operator import (
-    CACHE_PAGES, CACHE_ROWS, HEADS, HEAD_DIM, HIDDEN, KV_LORA, OPERATOR,
-    Q_LORA, Q_OUT, RMS_NORM_EPS_DEFAULT, ROPE_DIM, torch_declarations,
-    validate_values,
+    CACHE_PAGES, CACHE_ROWS, DEFAULT_HEAD_NUM, HEAD_DIM, HIDDEN, KV_LORA,
+    MAX_HEAD_NUM, OPERATOR, Q_LORA, RMS_NORM_EPS_DEFAULT, ROPE_DIM,
+    q_out_dim, torch_declarations, validate_values, w_qb_nz_shape,
 )
 from flashinfer.operators.runtime import fake
+
+HEAD_NUM_CASES = (1, 16, 31, 32, 63, 64)
 
 
 def meta(shape, dtype):
     return torch.empty(shape, dtype=dtype, device="meta")
 
 
-def arguments(t=1, rms_norm_eps=RMS_NORM_EPS_DEFAULT):
+def arguments(t=1, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
+              q_head_num=DEFAULT_HEAD_NUM):
     return {
         "x": meta((t, HIDDEN), torch.bfloat16),
         "w_qa": meta((Q_LORA, HIDDEN), torch.bfloat16),
         "gamma_qa": meta((Q_LORA,), torch.bfloat16),
-        "w_qb": meta((Q_OUT // 32, Q_LORA // 16, 16, 32), torch.int8),
-        "w_qb_scale": meta((Q_OUT,), torch.bfloat16),
+        "w_qb": meta(w_qb_nz_shape(q_head_num), torch.int8),
+        "w_qb_scale": meta((q_out_dim(q_head_num),), torch.bfloat16),
         "w_kv": meta((KV_LORA, HIDDEN), torch.bfloat16),
         "gamma_kv": meta((KV_LORA,), torch.bfloat16),
         "rope_cos": meta((t, 1, 1, ROPE_DIM), torch.float32),
@@ -31,6 +34,7 @@ def arguments(t=1, rms_norm_eps=RMS_NORM_EPS_DEFAULT):
         "slot_indices": meta((t, 2), torch.int32),
         "kv_cache": meta((CACHE_PAGES, CACHE_ROWS, KV_LORA), torch.bfloat16),
         "rms_norm_eps": rms_norm_eps,
+        "q_head_num": q_head_num,
     }
 
 
@@ -42,16 +46,54 @@ def test_public_entry_and_metadata_only_fake():
     assert inspect.signature(module.mla_prolog) == OPERATOR.public_signature
     parameters = inspect.signature(module.mla_prolog).parameters
     assert parameters["rms_norm_eps"].default == RMS_NORM_EPS_DEFAULT
+    assert parameters["q_head_num"].default == DEFAULT_HEAD_NUM == 64
     assert parameters["qr_out"].default is None
     outputs = fake(OPERATOR.op, arguments(3))
     assert isinstance(outputs, tuple) and len(outputs) == 2
     q_output, qr = outputs
-    assert q_output.shape == (3, HEADS, HEAD_DIM)
+    assert q_output.shape == (3, DEFAULT_HEAD_NUM, HEAD_DIM)
     assert q_output.dtype == torch.bfloat16
     assert q_output.device.type == "meta"
     assert qr.shape == (3, Q_LORA)
     assert qr.dtype == torch.bfloat16
     assert qr.device.type == "meta"
+
+
+def test_q_head_num_drives_only_the_q_output_shape():
+    for q_head_num in HEAD_NUM_CASES:
+        q_output, qr = fake(OPERATOR.op, arguments(2, q_head_num=q_head_num))
+        assert q_output.shape == (2, q_head_num, HEAD_DIM)
+        assert q_output.dtype == torch.bfloat16
+        assert q_output.device.type == "meta"
+        # qr is Q-LoRA normalization and is never sharded by head count.
+        assert qr.shape == (2, Q_LORA)
+        assert qr.dtype == torch.bfloat16
+    assert MAX_HEAD_NUM == 64
+
+
+def test_invalid_q_head_num_is_rejected_before_dispatch():
+    for value in (0, 65, -1, True, 1.0, "64", None):
+        values = arguments(1)
+        values["q_head_num"] = value
+        try:
+            fake(OPERATOR.op, values)
+        except ValueError:
+            continue
+        raise AssertionError("invalid q_head_num was accepted: " + repr(value))
+
+
+def test_w_qb_and_scale_shapes_must_match_q_head_num():
+    for change in (
+        {"w_qb": meta(w_qb_nz_shape(DEFAULT_HEAD_NUM), torch.int8)},
+        {"w_qb_scale": meta((q_out_dim(DEFAULT_HEAD_NUM),), torch.bfloat16)},
+    ):
+        values = arguments(1, q_head_num=16)
+        values.update(change)
+        try:
+            fake(OPERATOR.op, values)
+        except ValueError:
+            continue
+        raise AssertionError("mismatched q_head_num weights accepted: " + repr(change))
 
 
 def test_rms_norm_eps_is_validated_before_dispatch():
@@ -83,14 +125,21 @@ def test_torch_declarations_declare_kv_cache_mutation():
         declarations[0].name + declarations[0].schema)
     assert [str(value.type) for value in functional.returns] == [
         "Tensor", "Tensor"]
-    assert functional.arguments[-3].name == "rms_norm_eps"
-    assert functional.arguments[-3].default_value == 1e-6
+    assert functional.arguments[-4].name == "rms_norm_eps"
+    assert functional.arguments[-4].default_value == 1e-6
+    assert functional.arguments[-3].name == "q_head_num"
+    assert functional.arguments[-3].default_value == 64
+    assert str(functional.arguments[-3].type) == "int"
+    out_schema = torch._C.parse_schema(
+        declarations[1].name + declarations[1].schema)
+    assert out_schema.arguments[-3].name == "q_head_num"
+    assert out_schema.arguments[-3].default_value == 64
 
 
 def test_invalid_metadata_is_rejected_before_dispatch():
     for change in (
         {"x": meta((0, HIDDEN), torch.bfloat16)},
-        {"w_qb": meta((Q_LORA, Q_OUT), torch.int8)},
+        {"w_qb": meta((Q_LORA, q_out_dim()), torch.int8)},
         {"kv_cache": meta((1, CACHE_ROWS, KV_LORA), torch.bfloat16)},
         {"rope_cos": meta((1, 1, ROPE_DIM), torch.float32)},
     ):
@@ -109,7 +158,7 @@ def test_validate_values_rejects_duplicate_slots_and_bad_rope():
         slot_indices=torch.tensor([[0, 0], [0, 0]], dtype=torch.int32),
         rope_cos=torch.ones(2, 1, 1, ROPE_DIM),
         rope_sin=torch.zeros(2, 1, 1, ROPE_DIM),
-        w_qb_scale=torch.ones(Q_OUT, dtype=torch.bfloat16),
+        w_qb_scale=torch.ones(q_out_dim(), dtype=torch.bfloat16),
         gamma_qa=torch.ones(Q_LORA, dtype=torch.bfloat16),
         gamma_kv=torch.ones(KV_LORA, dtype=torch.bfloat16),
     )
@@ -147,23 +196,31 @@ def test_nz_pack_roundtrip_and_partial_rope_primitive():
     assert torch.equal(rotated[0, 448:450], torch.tensor([-2.0, 1.0]))
 
 
-def test_qr_golden_is_the_bf16_rms_norm_row():
+def _seed_inputs(head_num):
     torch.manual_seed(0)
     x = (torch.randn(4, HIDDEN) * 0.05).to(torch.bfloat16)
     w_qa = (torch.randn(Q_LORA, HIDDEN) * 0.02).to(torch.bfloat16)
     gamma_qa = (torch.rand(Q_LORA) * 0.5 + 0.75).to(torch.bfloat16)
-    w_qb = torch.randint(-4, 5, (Q_LORA, Q_OUT), dtype=torch.int8)
-    w_qb_scale = (torch.rand(Q_OUT) * 0.004 + 0.002).to(torch.bfloat16)
+    w_qb = torch.randint(-4, 5, (Q_LORA, q_out_dim(head_num)), dtype=torch.int8)
+    w_qb_scale = (torch.rand(q_out_dim(head_num)) * 0.004 + 0.002).to(
+        torch.bfloat16)
     w_kv = (torch.randn(KV_LORA, HIDDEN) * 0.02).to(torch.bfloat16)
     gamma_kv = (torch.rand(KV_LORA) * 0.5 + 0.75).to(torch.bfloat16)
     angles = torch.rand(4, 1, 1, ROPE_DIM // 2) * 0.5
     rope_cos = torch.cos(angles).repeat_interleave(2, dim=-1)
     rope_sin = torch.sin(angles).repeat_interleave(2, dim=-1)
+    return x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv, rope_cos, rope_sin
+
+
+def test_qr_golden_is_the_bf16_rms_norm_row():
+    x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv, rope_cos, rope_sin = (
+        _seed_inputs(DEFAULT_HEAD_NUM))
 
     q_output, qr, kv_updates = cases.golden(
         torch, x, w_qa, gamma_qa, cases.pack_weight_nz(torch, w_qb),
         w_qb_scale, w_kv, gamma_kv, rope_cos, rope_sin)
-    assert qr.shape == (4, Q_LORA) and q_output.shape == (4, HEADS, HEAD_DIM)
+    assert qr.shape == (4, Q_LORA)
+    assert q_output.shape == (4, DEFAULT_HEAD_NUM, HEAD_DIM)
     assert kv_updates.shape == (4, KV_LORA)
 
     qa = cases._matmul_bf16(
@@ -178,6 +235,37 @@ def test_qr_golden_is_the_bf16_rms_norm_row():
         rms_norm_eps=1.0e-20)
     assert qr_tight.shape == qr.shape
     assert not torch.equal(qr_tight, qr)
+
+
+def test_cpu_golden_q_head_num_shapes_and_qr_independence():
+    base = _seed_inputs(DEFAULT_HEAD_NUM)
+    x, w_qa, gamma_qa, w_qb64, w_qb_scale64, w_kv, gamma_kv, rope_cos, rope_sin = base
+    q_output64, qr64, _ = cases.golden(
+        torch, x, w_qa, gamma_qa, cases.pack_weight_nz(torch, w_qb64),
+        w_qb_scale64, w_kv, gamma_kv, rope_cos, rope_sin)
+    for head_num in HEAD_NUM_CASES:
+        q_out = q_out_dim(head_num)
+        # NZ first dimension indexes 32-channel blocks, so the first
+        # head_num*16 blocks are exactly the first head_num*512 channels.
+        w_qb = cases.pack_weight_nz(torch, w_qb64[:, :q_out])
+        q_output, qr, kv_updates = cases.golden(
+            torch, x, w_qa, gamma_qa, w_qb, w_qb_scale64[:q_out],
+            w_kv, gamma_kv, rope_cos, rope_sin, q_head_num=head_num)
+        assert q_output.shape == (4, head_num, HEAD_DIM)
+        assert kv_updates.shape == (4, KV_LORA)
+        # qr never depends on the local head count (TP does not shard Q-LoRA).
+        assert torch.equal(qr, qr64)
+        # The Q-B channels are column-independent: any local head set must
+        # agree exactly with the same channels of the H=64 oracle.
+        torch.testing.assert_close(
+            q_output, q_output64[:, :head_num, :], atol=0.0, rtol=0.0)
+
+
+def test_case_parameters_cover_q_head_num_boundaries():
+    heads = {case.get("q_head_num", DEFAULT_HEAD_NUM)
+             for case in cases.CASE_PARAMETERS}
+    assert set(HEAD_NUM_CASES) <= heads
+    assert len(cases.TOLERANCES) == len(OPERATOR.output_names) == 2
 
 
 def test_case_tolerances_match_outputs():

@@ -23,14 +23,17 @@
 #include <cstdint>
 
 struct MlaPrologTilingData {
-    // Layout version 2 adds the rms_norm_eps attribute scalar. The device
-    // entry rejects any other version so a stale host/device pair cannot
+    // Layout version 3 adds the q_head_num attribute. The device entry
+    // rejects any other version so a stale host/device pair cannot
     // misinterpret the payload.
     uint32_t version;
     uint32_t t;
     uint32_t aicNum;
     uint32_t projectionSplits;
     uint32_t narrowM;
+    // Local Q head count in [1,64] (TP shard size); Q-B output channels are
+    // headNum * 512 and q_output is [t, headNum, 512].
+    uint32_t headNum;
     // FP32 RMSNorm epsilon parsed from the rms_norm_eps OpDef attribute;
     // applied to both the Q and KV branches. Always finite and > 0.
     float rmsNormEps;

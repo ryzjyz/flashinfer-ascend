@@ -1,14 +1,15 @@
-"""DS4.1 MLA prolog: fixed-shape fused projection, norm, quantization and RoPE.
+"""DS4.1 MLA prolog: fused projection, norm, quantization and RoPE.
 
 The public contract is one BF16 token block ``x`` of shape ``[T, 5120]`` with
-``T`` in ``[1, 4096]``. The fused chain is:
+``T`` in ``[1, 4096]`` and a local Q head count ``q_head_num`` in ``[1, 64]``.
+The fused chain is:
 
 1. ``x @ w_qa.T`` then RMSNorm with ``gamma_qa``; the same BF16 normalized row
    is the required output ``qr[T, 1280] = q_norm(wq_a(x))``;
 2. dynamic per-token INT8 quantization of the normalized Q-LoRA activation;
 3. INT8 ``@ w_qb`` with per-token and per-output-channel dequantization;
 4. partial RoPE on the last 64 of 512 head channels, producing
-   ``q_output[T, 64, 512]``;
+   ``q_output[T, q_head_num, 512]``;
 5. ``x @ w_kv.T`` then RMSNorm with ``gamma_kv``, partial RoPE, and an in-place
    scatter of the 512 values into ``kv_cache`` rows addressed by
    ``slot_indices[T, 2]``.
@@ -16,6 +17,14 @@ The public contract is one BF16 token block ``x`` of shape ``[T, 5120]`` with
 ``rms_norm_eps`` is the FP32 epsilon added to both RMSNorm branches; the
 default ``1e-6`` preserves the frozen contract and DS4.1 callers may pass
 ``1e-20``. It must be finite and strictly positive.
+
+``q_head_num`` is the local Q head count in ``[1, 64]`` (default ``64``). TP
+sharding is the caller's responsibility: one device processes only its local
+heads and never communicates across cards. ``w_qb`` is
+``[q_head_num*16, 80, 16, 32]`` INT8 FRACTAL_NZ, ``w_qb_scale`` is
+``[q_head_num*512]``, ``q_output`` is ``[T, q_head_num, 512]`` and ``qr``
+stays ``[T, 1280]`` because Q-LoRA is not sharded. The default ``64`` keeps
+the previous byte-exact device behavior.
 
 The cache rows not addressed by ``slot_indices`` are untouched sentinels.
 
@@ -38,16 +47,33 @@ OP = "attention.mla_prolog"
 HIDDEN = 5120
 Q_LORA = 1280
 KV_LORA = 512
-HEADS = 64
 HEAD_DIM = 512
+DEFAULT_HEAD_NUM = 64
+MAX_HEAD_NUM = 64
+MIN_HEAD_NUM = 1
 NOPE_DIM = 448
 ROPE_DIM = 64
-Q_OUT = HEADS * HEAD_DIM
 CACHE_PAGES = 22594
 CACHE_ROWS = 128
-W_QB_NZ_SHAPE = (Q_OUT // 32, Q_LORA // 16, 16, 32)
 MIN_T = 1
 MAX_T = 4096
+
+
+def q_out_dim(q_head_num=DEFAULT_HEAD_NUM):
+    """Q-B output channels (GEMM N) for one token and ``q_head_num`` heads."""
+    return int(q_head_num) * HEAD_DIM
+
+
+def w_qb_nz_shape(q_head_num=DEFAULT_HEAD_NUM):
+    """FRACTAL_NZ shape of the INT8 Q-B weight for ``q_head_num`` heads."""
+    return (q_out_dim(q_head_num) // 32, Q_LORA // 16, 16, 32)
+
+
+def _head_num(value):
+    """Reject head counts the kernel cannot represent (also rejects bool)."""
+    if type(value) is not int or not MIN_HEAD_NUM <= value <= MAX_HEAD_NUM:
+        raise ValueError("q_head_num must be an integer in [1, 64]")
+    return value
 
 INPUT_NAMES = (
     "x", "w_qa", "gamma_qa", "w_qb", "w_qb_scale", "w_kv", "gamma_kv",
@@ -94,6 +120,7 @@ def infer(arguments, layouts):
             or not math.isfinite(rms_norm_eps) or rms_norm_eps <= 0):
         raise ValueError("rms_norm_eps must be finite and > 0")
     rms_norm_eps = float(rms_norm_eps)
+    q_head_num = _head_num(arguments.get("q_head_num", DEFAULT_HEAD_NUM))
     t = int(x.shape[0]) if len(x.shape) == 2 else -1
     if t < MIN_T or t > MAX_T:
         raise ValueError("x must have shape [T, 5120] with T in [1, 4096]")
@@ -101,8 +128,8 @@ def infer(arguments, layouts):
         "x": (t, HIDDEN),
         "w_qa": (Q_LORA, HIDDEN),
         "gamma_qa": (Q_LORA,),
-        "w_qb": W_QB_NZ_SHAPE,
-        "w_qb_scale": (Q_OUT,),
+        "w_qb": w_qb_nz_shape(q_head_num),
+        "w_qb_scale": (q_out_dim(q_head_num),),
         "w_kv": (KV_LORA, HIDDEN),
         "gamma_kv": (KV_LORA,),
         "rope_cos": (t, 1, 1, ROPE_DIM),
@@ -139,10 +166,10 @@ def infer(arguments, layouts):
     return Invocation(
         tuple(arguments[name] for name in INPUT_NAMES),
         (
-            OutputSpec((t, HEADS, HEAD_DIM), "bfloat16", x.device),
+            OutputSpec((t, q_head_num, HEAD_DIM), "bfloat16", x.device),
             OutputSpec((t, Q_LORA), "bfloat16", x.device),
         ),
-        {"rms_norm_eps": rms_norm_eps},
+        {"rms_norm_eps": rms_norm_eps, "q_head_num": q_head_num},
         InferenceSpec(
             compute_dtype="bfloat16", accumulator_dtype="float32",
             quantization=QUANTIZATION, fusion_ops=FUSION_OPS,
@@ -190,23 +217,26 @@ def validate_values(arguments):
 
 
 def _arguments(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-               rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps):
+               rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps,
+               q_head_num=DEFAULT_HEAD_NUM):
     return {
         "x": x, "w_qa": w_qa, "gamma_qa": gamma_qa, "w_qb": w_qb,
         "w_qb_scale": w_qb_scale, "w_kv": w_kv, "gamma_kv": gamma_kv,
         "rope_cos": rope_cos, "rope_sin": rope_sin,
         "slot_indices": slot_indices, "kv_cache": kv_cache,
-        "rms_norm_eps": rms_norm_eps,
+        "rms_norm_eps": rms_norm_eps, "q_head_num": q_head_num,
     }
 
 
-def _check_out(out, qr_out, x):
+def _check_out(out, qr_out, x, q_head_num=DEFAULT_HEAD_NUM):
     import torch
+    q_head_num = _head_num(q_head_num)
     t = int(x.shape[0])
-    if (tuple(out.shape) != (t, HEADS, HEAD_DIM)
+    if (tuple(out.shape) != (t, q_head_num, HEAD_DIM)
             or out.dtype != torch.bfloat16 or out.device != x.device):
         raise ValueError(
-            "q_output must be bfloat16 [T,64,512] on the input device")
+            "q_output must be bfloat16 [T,%d,512] on the input device"
+            % q_head_num)
     if (tuple(qr_out.shape) != (t, Q_LORA)
             or qr_out.dtype != torch.bfloat16 or qr_out.device != x.device):
         raise ValueError(
@@ -215,7 +245,8 @@ def _check_out(out, qr_out, x):
 
 def _impl(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
           rope_cos, rope_sin, slot_indices, kv_cache, out=None, qr_out=None,
-          *, rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None, kernel_id=None):
+          *, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
+          q_head_num=DEFAULT_HEAD_NUM, backend=None, kernel_id=None):
     """Eager dispatch shared by the functional and out torch declarations."""
     from flashinfer.operators.runtime import allocate_output
     from flashinfer.runtime import build_signature, current_hardware, dispatch
@@ -223,14 +254,14 @@ def _impl(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
 
     arguments = _arguments(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-        rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps)
+        rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps, q_head_num)
     validate_values(arguments)
     invocation = infer(arguments, None)
     if out is None:
         out = allocate_output(invocation.outputs[0])
     if qr_out is None:
         qr_out = allocate_output(invocation.outputs[1])
-    _check_out(out, qr_out, x)
+    _check_out(out, qr_out, x, q_head_num)
     tensors = invocation.inputs + (out, qr_out)
     request = build_signature(
         OP, tensors, inference=invocation.inference,
@@ -243,30 +274,34 @@ def _impl(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
 
 def _mla_prolog(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
                 rope_cos, rope_sin, slot_indices, kv_cache,
-                *, rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None, kernel_id=None):
+                *, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
+                q_head_num=DEFAULT_HEAD_NUM, backend=None, kernel_id=None):
     return _impl(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
         rope_cos, rope_sin, slot_indices, kv_cache,
-        rms_norm_eps=rms_norm_eps, backend=backend, kernel_id=kernel_id)
+        rms_norm_eps=rms_norm_eps, q_head_num=q_head_num,
+        backend=backend, kernel_id=kernel_id)
 
 
 def _mla_prolog_out(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
                     rope_cos, rope_sin, slot_indices, kv_cache, q_output, qr,
-                    *, rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None, kernel_id=None):
+                    *, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
+                    q_head_num=DEFAULT_HEAD_NUM, backend=None, kernel_id=None):
     _impl(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
         rope_cos, rope_sin, slot_indices, kv_cache, out=q_output, qr_out=qr,
-        rms_norm_eps=rms_norm_eps, backend=backend, kernel_id=kernel_id)
+        rms_norm_eps=rms_norm_eps, q_head_num=q_head_num,
+        backend=backend, kernel_id=kernel_id)
 
 
 def _mla_prolog_meta(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv,
                      gamma_kv, rope_cos, rope_sin, slot_indices,
                      kv_cache, *, rms_norm_eps=RMS_NORM_EPS_DEFAULT,
-                     backend=None, kernel_id=None):
+                     q_head_num=DEFAULT_HEAD_NUM, backend=None, kernel_id=None):
     import torch
     arguments = _arguments(
         x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
-        rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps)
+        rope_cos, rope_sin, slot_indices, kv_cache, rms_norm_eps, q_head_num)
     invocation = infer(arguments, None)
     return tuple(
         torch.empty(specification.shape,
@@ -277,9 +312,10 @@ def _mla_prolog_meta(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv,
 def _mla_prolog_out_meta(x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv,
                          gamma_kv, rope_cos, rope_sin, slot_indices,
                          kv_cache, q_output, qr, *,
-                         rms_norm_eps=RMS_NORM_EPS_DEFAULT, backend=None,
+                         rms_norm_eps=RMS_NORM_EPS_DEFAULT,
+                         q_head_num=DEFAULT_HEAD_NUM, backend=None,
                          kernel_id=None):
-    _check_out(q_output, qr, x)
+    _check_out(q_output, qr, x, q_head_num)
     return None
 
 
@@ -292,8 +328,8 @@ def torch_declarations():
         "Tensor w_qb_scale, Tensor w_kv, Tensor gamma_kv, Tensor rope_cos, "
         "Tensor rope_sin, Tensor slot_indices, Tensor(a!) kv_cache"
     )
-    options = ("*, float rms_norm_eps=1e-6, str? backend=None, "
-               "str? kernel_id=None")
+    options = ("*, float rms_norm_eps=1e-6, int q_head_num=64, "
+               "str? backend=None, str? kernel_id=None")
     return (
         AscendCOp(
             "flashinfer::mla_prolog",
@@ -322,10 +358,14 @@ OPERATOR = OperatorDefinition(
     infer=infer,
     validate_values=validate_values,
     description=(
-        "DS4.1 MLA prolog fusion with fixed H=5120, Q_LORA=1280, KV_LORA=512, "
-        "N=64, D_NOPE=448 and D_ROPE=64. Returns q_output[T,64,512] and the "
-        "required qr[T,1280] = q_norm(wq_a(x)), and updates the addressed "
+        "DS4.1 MLA prolog fusion with fixed HIDDEN=5120, Q_LORA=1280, "
+        "KV_LORA=512, HEAD_DIM=512, D_NOPE=448 and D_ROPE=64, and a local "
+        "Q head count q_head_num in [1,64] (default 64) for TP sharding. "
+        "Returns q_output[T,q_head_num,512] and the unsharded "
+        "qr[T,1280] = q_norm(wq_a(x)), and updates the addressed "
         "kv_cache rows in place; unaddressed rows are sentinels. "
+        "w_qb is [q_head_num*16,80,16,32] INT8 NZ and w_qb_scale is "
+        "[q_head_num*512]. "
         "rms_norm_eps (default 1e-6) parameterizes both RMSNorm branches and "
         "must be finite and > 0. BF16 materialization points and INT8 dynamic "
         "quantization are frozen. T is in [1,4096] and each call is one "

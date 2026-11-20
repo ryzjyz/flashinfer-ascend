@@ -15,8 +15,8 @@ silently shrinking the public shape.
 """
 
 from .operator import (
-    CACHE_PAGES, CACHE_ROWS, HEADS, HEAD_DIM, HIDDEN, KV_LORA, MAX_T, MIN_T,
-    NOPE_DIM, Q_LORA, Q_OUT, ROPE_DIM, W_QB_NZ_SHAPE,
+    CACHE_PAGES, CACHE_ROWS, DEFAULT_HEAD_NUM, HEAD_DIM, HIDDEN, KV_LORA,
+    MAX_T, MIN_T, NOPE_DIM, Q_LORA, ROPE_DIM, q_out_dim,
 )
 
 SENTINEL_PAGE = CACHE_PAGES - 1
@@ -144,11 +144,14 @@ def golden_kv_updates(torch, x, w_kv, gamma_kv, rope_cos, rope_sin, *,
 
 def golden(torch, x, w_qa, gamma_qa, w_qb_nz, w_qb_scale, w_kv, gamma_kv,
            rope_cos, rope_sin, *, row_chunk=8, column_chunk=2048,
-           rms_norm_eps=1.0e-6):
+           rms_norm_eps=1.0e-6, q_head_num=DEFAULT_HEAD_NUM):
     """Return ``(q_output, qr, kv_updates)`` for the frozen nine-op chain.
 
-    ``kv_cache`` is not passed: the oracle returns the rows the kernel scatters
-    and the caller applies them to the cache representation it owns.
+    ``q_head_num`` selects the local Q head count (1..64); ``w_qb_nz`` and
+    ``w_qb_scale`` must describe ``q_head_num*512`` output channels and
+    ``qr`` never depends on it. ``kv_cache`` is not passed: the oracle returns
+    the rows the kernel scatters and the caller applies them to the cache
+    representation it owns.
     """
     x = bf16_round(torch, _cpu_float(x))
     w_qa = bf16_round(torch, _cpu_float(w_qa))
@@ -157,12 +160,14 @@ def golden(torch, x, w_qa, gamma_qa, w_qb_nz, w_qb_scale, w_kv, gamma_kv,
     w_kv = bf16_round(torch, _cpu_float(w_kv))
     gamma_kv = bf16_round(torch, _cpu_float(gamma_kv))
     rope_cos, rope_sin = _cpu_float(rope_cos), _cpu_float(rope_sin)
-    w_qb = unpack_weight_nz(torch, w_qb_nz.detach().to("cpu"), Q_LORA, Q_OUT)
+    q_out = q_out_dim(q_head_num)
+    w_qb = unpack_weight_nz(torch, w_qb_nz.detach().to("cpu"), Q_LORA, q_out)
     t = x.shape[0]
     if t < MIN_T or t > MAX_T:
         raise ValueError("T must be in [1, 4096]")
 
-    q_output = torch.empty((t, HEADS, HEAD_DIM), dtype=torch.float32)
+    q_output = torch.empty(
+        (t, int(q_head_num), HEAD_DIM), dtype=torch.float32)
     qr = torch.empty((t, Q_LORA), dtype=torch.float32)
     kv_updates = torch.empty((t, KV_LORA), dtype=torch.float32)
     for begin in range(0, t, row_chunk):
@@ -174,7 +179,7 @@ def golden(torch, x, w_qa, gamma_qa, w_qb_nz, w_qb_scale, w_kv, gamma_kv,
         qa_int8, qa_scale = _dynamic_quant(torch, qa_norm)
         q_raw = _quant_matmul_bf16(
             torch, qa_int8, w_qb, qa_scale, w_qb_scale, column_chunk,
-        ).reshape(end - begin, HEADS, HEAD_DIM)
+        ).reshape(end - begin, int(q_head_num), HEAD_DIM)
         q_output[begin:end] = _partial_rope_bf16(
             torch, q_raw, rope_cos[begin:end], rope_sin[begin:end])
 
@@ -190,10 +195,17 @@ def sentinel_row(torch):
     return bf16_round(torch, values)
 
 
-def sample(torch, torch_npu, *, t=1, rms_norm_eps=1.0e-6):
-    """Deterministic A3 input. The dense cache is allocated on the NPU."""
+def sample(torch, torch_npu, *, t=1, rms_norm_eps=1.0e-6,
+           q_head_num=DEFAULT_HEAD_NUM):
+    """Deterministic A3 input. The dense cache is allocated on the NPU.
+
+    ``q_head_num`` selects the local head count; ``w_qb``/``w_qb_scale`` are
+    generated at ``q_head_num*512`` output channels. ``H=64`` reproduces the
+    frozen pre-sharding inputs bit for bit.
+    """
     rng = torch.Generator().manual_seed(20261117 + int(t))
     dtype = torch.bfloat16
+    q_out = q_out_dim(q_head_num)
 
     def normal(shape, scale):
         return (torch.randn(shape, generator=rng) * scale).to(dtype)
@@ -201,9 +213,9 @@ def sample(torch, torch_npu, *, t=1, rms_norm_eps=1.0e-6):
     x = normal((t, HIDDEN), 0.05)
     w_qa = normal((Q_LORA, HIDDEN), 0.02)
     gamma_qa = (torch.rand((Q_LORA,), generator=rng) * 0.5 + 0.75).to(dtype)
-    w_qb_logical = torch.randint(-4, 5, (Q_LORA, Q_OUT), generator=rng, dtype=torch.int8)
+    w_qb_logical = torch.randint(-4, 5, (Q_LORA, q_out), generator=rng, dtype=torch.int8)
     w_qb = pack_weight_nz(torch, w_qb_logical)
-    w_qb_scale = (torch.rand((Q_OUT,), generator=rng) * 0.004 + 0.002).to(dtype)
+    w_qb_scale = (torch.rand((q_out,), generator=rng) * 0.004 + 0.002).to(dtype)
     w_kv = normal((KV_LORA, HIDDEN), 0.02)
     gamma_kv = (torch.rand((KV_LORA,), generator=rng) * 0.5 + 0.75).to(dtype)
     angles = torch.rand((t, 1, 1, ROPE_DIM // 2), generator=rng) * 0.5
@@ -229,10 +241,14 @@ def sample(torch, torch_npu, *, t=1, rms_norm_eps=1.0e-6):
     q_output, qr, _ = golden(
         torch, x, w_qa, gamma_qa, w_qb, w_qb_scale, w_kv, gamma_kv,
         rope_cos, rope_sin, rms_norm_eps=rms_norm_eps,
+        q_head_num=q_head_num,
     )
     expected = (q_output, qr)
-    options = {} if float(rms_norm_eps) == 1.0e-6 else dict(
-        rms_norm_eps=float(rms_norm_eps))
+    options = {}
+    if float(rms_norm_eps) != 1.0e-6:
+        options["rms_norm_eps"] = float(rms_norm_eps)
+    if int(q_head_num) != DEFAULT_HEAD_NUM:
+        options["q_head_num"] = int(q_head_num)
     return args, options, expected
 
 
@@ -242,6 +258,16 @@ CASE_PARAMETERS = (
     dict(t=193),
     # Exercise the keyword attribute end to end with the DS4.1 value.
     dict(t=96, rms_norm_eps=1.0e-20),
+    # q_head_num for TP sharding; H=64 is the byte-identical default above.
+    # H=1 is the hardest boundary (one 512-channel Q-B GEMM tile pair), and
+    # 31/63 cover non-multiple-of-4 rope batches.
+    dict(t=1, q_head_num=1),
+    dict(t=1, q_head_num=16),
+    dict(t=1, q_head_num=31),
+    dict(t=1, q_head_num=32),
+    dict(t=1, q_head_num=63),
+    dict(t=1, q_head_num=64),
+    dict(t=96, q_head_num=1),
 )
 # BF16 policy v2: matched ratio >= 0.999, atol/rtol = 0.0156, max_abs <= 1.0.
 # torch.testing.assert_close consumes the (atol, rtol) pair per output; the

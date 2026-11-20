@@ -52,13 +52,16 @@ namespace Dsv41 {
 constexpr uint32_t kHidden = 5120;
 constexpr uint32_t kQa = 1280;
 constexpr uint32_t kKv = 512;
-constexpr uint32_t kHeads = 64;
+// Local Q head count is a runtime value (1..64, one per TP shard); the fixed
+// 64 is only the staging/capacity bound. Q-B output channels N are
+// headNum * kHeadDim, never a compile-time constant.
+constexpr uint32_t kMaxHeads = 64;
+constexpr uint32_t kMinHeads = 1;
 constexpr uint32_t kHeadDim = 512;
 constexpr uint32_t kNopeDim = 448;
 constexpr uint32_t kRopeDim = 64;
 constexpr uint32_t kCacheRowsPerPage = 128;
 constexpr uint32_t kMaxT = 4096;
-constexpr uint32_t kQbOut = kHeads * kHeadDim;
 constexpr uint32_t kWorkspaceStages = 2;
 // Split-K of the S0 dual projection: K=5120 is divided into per-split extents that
 // are multiples of kProjectionSplitKTile (e.g. {1792, 1792, 1536} for 3 splits), so
@@ -146,7 +149,8 @@ struct WorkspaceLayout {
     uint64_t totalBytes;
 };
 
-inline WorkspaceLayout MakeWorkspaceLayout(uint32_t t, uint32_t aicCount)
+inline WorkspaceLayout MakeWorkspaceLayout(uint32_t t, uint32_t aicCount,
+                                           uint32_t headNum)
 {
     WorkspaceLayout layout{};
     layout.qaOffset = 0;
@@ -167,7 +171,9 @@ inline WorkspaceLayout MakeWorkspaceLayout(uint32_t t, uint32_t aicCount)
     layout.qScaleOffset = layout.qInt8Offset + layout.qInt8Bytes;
     layout.qScaleBytes = Align512(static_cast<uint64_t>(t) * sizeof(float));
     layout.wScaleFpOffset = layout.qScaleOffset + layout.qScaleBytes;
-    layout.wScaleFpBytes = Align512(static_cast<uint64_t>(kQbOut) * sizeof(float));
+    // One FP32 weight-dequant scale per Q-B output channel (headNum * 512).
+    layout.wScaleFpBytes = Align512(
+        static_cast<uint64_t>(headNum) * kHeadDim * sizeof(float));
     layout.qmmOffset = layout.wScaleFpOffset + layout.wScaleFpBytes;
     layout.qmmBytes = Align512(
         static_cast<uint64_t>(aicCount) * kWorkspaceStages * 128U * 256U * sizeof(int32_t));
@@ -393,6 +399,8 @@ struct NormQuantKernel {
         GM_ADDR qr;
         // FP32 RMSNorm epsilon applied to both the Q and the KV branch.
         float rmsNormEps;
+        // Local Q head count; w_qb_scale has headNum * kHeadDim entries.
+        uint32_t headNum;
     };
     using Arguments = Params;
 
@@ -404,6 +412,7 @@ struct NormQuantKernel {
             args.wScale != nullptr && args.wScaleFp != nullptr && args.qr != nullptr &&
             args.rmsNormEps > 0.0F &&
             args.t > 0 && args.t <= kMaxT &&
+            args.headNum >= kMinHeads && args.headNum <= kMaxHeads &&
             args.projectionSplits > 0 &&
             args.projectionSplits <= kMaxProjectionSplits;
     }
@@ -501,8 +510,10 @@ struct NormQuantKernel {
 
         // This conversion is independent of the projection output. Run it while
         // the AIC side is still producing the projection to hide its latency.
+        // headNum * kHeadDim is always a multiple of kScaleChunk.
         constexpr uint32_t kScaleChunk = 256;
-        for (uint32_t chunk = blockIdx; chunk < kQbOut / kScaleChunk;
+        const uint32_t qbOut = params.headNum * kHeadDim;
+        for (uint32_t chunk = blockIdx; chunk < qbOut / kScaleChunk;
              chunk += blockNum) {
             const uint32_t start = chunk * kScaleChunk;
             AscendC::DataCopy(gammaQaBf16, gmWScale[start], kScaleChunk);
@@ -841,6 +852,8 @@ struct RopeScatterKernel {
         GM_ADDR slots;
         GM_ADDR cache;
         uint32_t t;
+        // Local Q head count: qOutput is [t, headNum, kHeadDim].
+        uint32_t headNum;
     };
     using Arguments = Params;
 
@@ -848,7 +861,8 @@ struct RopeScatterKernel {
     {
         return args.qOutput != nullptr && args.kv != nullptr && args.ropeCos != nullptr &&
             args.ropeSin != nullptr && args.slots != nullptr && args.cache != nullptr &&
-            args.t > 0 && args.t <= kMaxT;
+            args.t > 0 && args.t <= kMaxT &&
+            args.headNum >= kMinHeads && args.headNum <= kMaxHeads;
     }
 
     static size_t GetWorkspaceSize(const Arguments &)
@@ -886,8 +900,10 @@ struct RopeScatterKernel {
         constexpr uint32_t kSin = 9216;
         constexpr uint32_t kSign = 10240;
         constexpr uint32_t kOffsets = 11264;
-        // Whole-token staging for the kHeads x kRopeDim rope slices: one strided
-        // descriptor per token instead of one per 4-head batch. 64 * 64 * 2 = 8192 B.
+        // Whole-token staging for the headNum x kRopeDim rope slices: one
+        // strided descriptor per token instead of one per 4-head batch. The
+        // staging capacity stays at the 64-head bound even when headNum < 64:
+        // kMaxHeads * kRopeDim * sizeof(bfloat16_t) = 8192 B.
         constexpr uint32_t kQRows = 12288;
 
         Arch::Resource<Arch::AtlasA2> resource;
@@ -949,6 +965,7 @@ struct RopeScatterKernel {
         const uint32_t blockNum =
             AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
         for (uint32_t token = blockIdx; token < params.t; token += blockNum) {
+            const uint32_t headCount = params.headNum;
             const uint64_t ropeOffset = static_cast<uint64_t>(token) * kRopeDim;
             for (uint32_t batch = 0; batch < kHeadBatch; ++batch) {
                 AscendC::DataCopy(
@@ -956,8 +973,9 @@ struct RopeScatterKernel {
                 AscendC::DataCopy(
                     sin[batch * kRopeDim], gmSin[ropeOffset], kRopeDim);
             }
-            // One strided descriptor per token for all kHeads rope slices
-            // (was: kHeads/kHeadBatch = 16 descriptors of 4 rows each).
+            // One strided descriptor per token for all headCount rope slices
+            // (was: headCount/kHeadBatch descriptors of 4 rows each). The
+            // descriptor shrinks with headCount; staging capacity is unchanged.
             // slotFree[1]/pending[1] guard this staging buffer (slot 1 is no
             // longer used by the per-batch row buffer).
             if (pending[1]) {
@@ -965,39 +983,45 @@ struct RopeScatterKernel {
                 pending[1] = false;
             }
             const uint64_t qRopeOffset =
-                static_cast<uint64_t>(token) * kHeads * kHeadDim + kNopeDim;
+                static_cast<uint64_t>(token) * headCount * kHeadDim + kNopeDim;
             AscendC::DataCopy(
                 qRows, gmQ[qRopeOffset],
-                AscendC::DataCopyParams(kHeads, 4U, 28U, 0U));
+                AscendC::DataCopyParams(headCount, 4U, 28U, 0U));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(inputReady[0]);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(inputReady[0]);
             AscendC::Mul(sin, sin, sign, kBatchRope);
             AscendC::PipeBarrier<PIPE_V>();
 
-            for (uint32_t head = 0; head < kHeads; head += kHeadBatch) {
+            for (uint32_t head = 0; head < headCount; head += kHeadBatch) {
                 const uint32_t slot = (head / kHeadBatch) & 1U;
                 AscendC::LocalTensor<bfloat16_t> rows =
                     qRows[(head / kHeadBatch) * kBatchRope];
+                // Partial final batch for headNum not divisible by 4: only the
+                // existing heads are cast/rotated, so the uninitialized tail of
+                // the staging buffer is never touched.
+                const uint32_t batchHeads =
+                    (headCount - head < kHeadBatch) ? headCount - head : kHeadBatch;
+                const uint32_t count = batchHeads * kRopeDim;
 
                 AscendC::Cast(
                     x[slot], rows,
-                    AscendC::RoundMode::CAST_NONE, kBatchRope);
+                    AscendC::RoundMode::CAST_NONE, count);
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(output[slot], x[slot], cos, kBatchRope);
-                AscendC::Gather(rotated[slot], x[slot], offsets, 0U, kBatchRope);
+                AscendC::Mul(output[slot], x[slot], cos, count);
+                AscendC::Gather(rotated[slot], x[slot], offsets, 0U, count);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::FusedMulAdd(
-                    rotated[slot], sin, output[slot], kBatchRope);
+                    rotated[slot], sin, output[slot], count);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Cast(
                     rows, rotated[slot],
-                    AscendC::RoundMode::CAST_RINT, kBatchRope);
+                    AscendC::RoundMode::CAST_RINT, count);
             }
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::DataCopy(
                 gmQ[qRopeOffset], qRows,
-                AscendC::DataCopyParams(kHeads, 4U, 0U, 28U));
+                AscendC::DataCopyParams(headCount, 4U, 0U, 28U));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(slotFree[1]);
             pending[1] = true;
 

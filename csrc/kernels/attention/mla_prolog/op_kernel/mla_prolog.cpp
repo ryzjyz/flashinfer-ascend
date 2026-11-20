@@ -40,6 +40,9 @@ CATLASS_DEVICE void MlaPrologDevice(
     GM_ADDR userWorkspace, const __gm__ TilingData *tilingData)
 {
     const uint32_t t = tilingData->t;
+    // Local Q head count for this TP shard (1..64); the host tiler validated it
+    // against w_qb/w_qb_scale shapes. Q-B output channels N = headNum*512.
+    const uint32_t headNum = tilingData->headNum;
     GM_ADDR qa = userWorkspace + tilingData->qaOffset;
     GM_ADDR kv = userWorkspace + tilingData->kvOffset;
     GM_ADDR kvNorm = userWorkspace + tilingData->kvNormOffset;
@@ -60,15 +63,15 @@ CATLASS_DEVICE void MlaPrologDevice(
     // OpDef attribute is parsed by host tiling and read here.
     Dsv41::NormQuantKernel::Arguments normArgs{
         qa, kv, kvNorm, gammaQa, gammaKv, qInt8, qScale, wQbScale, wScaleFp,
-        t, tilingData->projectionSplits, qr, tilingData->rmsNormEps};
+        t, tilingData->projectionSplits, qr, tilingData->rmsNormEps, headNum};
     Dsv41::RopeScatterKernel::Arguments ropeArgs{
-        qOutput, kvNorm, ropeCos, ropeSin, slotIndices, kvCache, t};
+        qOutput, kvNorm, ropeCos, ropeSin, slotIndices, kvCache, t, headNum};
 
     // QuantMatmul::Arguments stores generic uint8_t*; building its Params
     // directly keeps the __gm__ address space of the device entry and matches
     // the CATLASS Params layout without a host-only conversion.
     using Quant = Dsv41::QuantMatmul;
-    const uint32_t m = t, n = Dsv41::kQbOut, k = Dsv41::kQa;
+    const uint32_t m = t, n = headNum * Dsv41::kHeadDim, k = Dsv41::kQa;
     Quant::Params quantParams{};
     quantParams.problemShape = GemmCoord(m, n, k);
     quantParams.ptrA = reinterpret_cast<__gm__ Quant::ElementA *>(qInt8);
@@ -104,8 +107,9 @@ extern "C" __global__ __aicore__ void fi_mla_prolog(
     }
     AscendC::SetSysWorkspace(workspace);
     auto *data = reinterpret_cast<__gm__ MlaPrologTilingData *>(tiling);
-    if (data->version != 2 || data->t < 1 || data->t > Dsv41::kMaxT ||
+    if (data->version != 3 || data->t < 1 || data->t > Dsv41::kMaxT ||
         data->aicNum == 0 || data->hardwareSyncAddr == 0 ||
+        data->headNum < Dsv41::kMinHeads || data->headNum > Dsv41::kMaxHeads ||
         !(data->rmsNormEps > 0.0F)) {
         return;
     }
