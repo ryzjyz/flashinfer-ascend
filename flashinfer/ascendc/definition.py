@@ -160,6 +160,11 @@ class AscendCImplementation(ImplementationDefinition):
 
             metadata.setdefault("capability_binding", direct_operator_binding(
                 operator, capability, "ascendc", kernel_id))
+        elif operator.public_entry is not None:
+            from flashinfer.operators.capability import rich_operator_binding
+
+            metadata.setdefault("capability_binding", rich_operator_binding(
+                operator, capability, "ascendc", kernel_id))
         native = NativeDefinition(
             name=build.recipe_id or operator.name,
             kernel_id=kernel_id,

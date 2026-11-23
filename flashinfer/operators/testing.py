@@ -60,22 +60,58 @@ def case_tolerances(cases, configuration):
     return cases.TOLERANCES
 
 
+def is_void_mutation(operator):
+    """Rich ``-> ()`` operators verify caller-owned mutations, not fresh outputs."""
+    return bool(
+        not operator.schema and not operator.output_names and operator.torch_contract
+        and operator.torch_contract[0].endswith("-> ()")
+    )
+
+
+def _implementation_options(operator, options, *, kernel_id=None, backend=None):
+    """Only schema-generated facades own out/backend/kernel_id routing arguments."""
+    if not operator.schema:
+        return dict(options)
+    if kernel_id is not None:
+        options = dict(options, kernel_id=kernel_id)
+    if backend is not None:
+        options = dict(options, backend=backend)
+    return options
+
+
+def run_void_mutation(torch, call, cases, args, options, expected):
+    """Execute one rich void case and verify its complete caller-owned effects."""
+    verify = getattr(cases, "verify_mutation", None)
+    if not callable(verify):
+        raise AssertionError("void mutation cases require verify_mutation(args, expected)")
+    originals = tuple(t for t in tuple(args) + tuple(options.values()) if isinstance(t, torch.Tensor))
+    pointers = tuple(t.data_ptr() for t in originals)
+    result = call(*args, **options)
+    assert result is None, "void mutation operator must return None"
+    assert pointers == tuple(t.data_ptr() for t in originals), "input storage changed"
+    return [float(value) for value in verify(torch, args, expected)]
+
+
 def numerical_cases(torch, torch_npu, name, *, first_only=False, kernel_id=None, backend=None):
     operator = definition(name)
     cases = cases_module(name)
     parameters = case_parameters(cases, kernel_id)
-    output_count = len(cases.TOLERANCES)
-    if not output_count or (operator.schema and output_count != len(operator.output_names)):
+    void_mutation = is_void_mutation(operator)
+    output_count = 0 if void_mutation else len(cases.TOLERANCES)
+    if not void_mutation and (
+            not output_count or (operator.schema and output_count != len(operator.output_names))):
         raise AssertionError("numerical cases and output tolerances must be explicit and nonempty")
     call = public_function(name)
     observations = {}
     for index, configuration in enumerate(parameters[:1] if first_only else parameters):
-        tolerances = case_tolerances(cases, configuration)
         args, options, expected = cases.sample(torch, torch_npu, **configuration)
-        if kernel_id is not None:
-            options = dict(options, kernel_id=kernel_id)
-        if backend is not None:
-            options = dict(options, backend=backend)
+        options = _implementation_options(operator, options, kernel_id=kernel_id, backend=backend)
+        if void_mutation:
+            errors = run_void_mutation(torch, call, cases, args, options, expected)
+            print(json.dumps(dict(case=configuration, max_abs=errors), sort_keys=True), flush=True)
+            observations[str(index)] = dict(case=configuration, max_abs=errors)
+            continue
+        tolerances = case_tolerances(cases, configuration)
         originals = tuple(t for t in tuple(args) + tuple(options.values()) if isinstance(t, torch.Tensor))
         pointers = tuple(t.data_ptr() for t in originals)
         expected = _outputs(expected, output_count)
@@ -197,7 +233,9 @@ def run(name, mode="matrix", *, kernel_id=None):
             args, options, _ = cases.sample(torch, torch_npu, **case_parameters(cases, kernel_id)[0])
             expected_error = AotMissingError if mode == "missing" else AotCorruptError
             try:
-                public_function(name)(*args, **dict(options, backend="ascendc", kernel_id=kernel_id))
+                options = _implementation_options(
+                    definition(name), options, kernel_id=kernel_id, backend="ascendc")
+                public_function(name)(*args, **options)
             except expected_error as error:
                 if mode == "missing":
                     assert error.spec.fingerprint == spec.fingerprint

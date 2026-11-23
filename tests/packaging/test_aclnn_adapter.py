@@ -205,3 +205,74 @@ def test_prebuilt_bridge_bundling_is_compiler_free_and_keeps_source_identity(tmp
     with pytest.raises(RuntimeError, match="source identity mismatch"):
         bundle_adapter(tmp_path / "rejected", directory=supplied)
     assert not (tmp_path / "rejected").exists()
+
+
+@pytest.mark.real_compile
+def test_native_adapter_empty_span_and_launch_failure_cleanup(tmp_path):
+    """Zero spans are valid and a failed native launch leaves no stuck guard."""
+    from flashinfer.aclnn.build import build_adapter
+
+    adapter = tmp_path / "adapter"
+    build_adapter(adapter)
+    code = r'''
+import ctypes as C
+import os
+from pathlib import Path
+import torch
+import torch_npu
+
+torch.npu.set_device(int(os.environ.get("FLASHINFER_TEST_NPU_DEVICE", "0")))
+api = C.CDLL(str(Path(os.environ["FLASHINFER_ACLNN_ADAPTER_PATH"]) / "libflashinfer_aclnn.so"))
+api.fi_aclnn_register.argtypes = [C.c_char_p, C.c_char_p, C.c_void_p, C.c_void_p,
+                                  C.c_uint64, C.c_uint64]
+api.fi_aclnn_register.restype = C.c_int
+query_type = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_void_p, C.c_void_p,
+                         C.POINTER(C.c_uint64), C.POINTER(C.c_void_p))
+launch_type = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_uint64, C.c_void_p, C.c_void_p)
+
+def empty_query(first, second, third, size, executor):
+    size[0] = 0
+    executor[0] = C.c_void_p(1)
+    return 0
+
+def success_launch(workspace, size, executor, stream):
+    return 0
+
+q, l = query_type(empty_query), launch_type(success_launch)
+assert api.fi_aclnn_register(b"empty-span-fixture", b"fixture", C.cast(q, C.c_void_p),
+                             C.cast(l, C.c_void_p), 1, 2) == 0
+empty = torch.empty(0).npu()
+try:
+    torch.ops.flashinfer_aclnn._execute("empty-span-fixture", [empty], [empty, empty])
+except RuntimeError as error:
+    assert "must not overlap" not in str(error)
+
+failure_query_type = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_void_p,
+                                 C.POINTER(C.c_uint64), C.POINTER(C.c_void_p))
+def failure_query(first, second, size, executor):
+    size[0] = 0
+    executor[0] = C.c_void_p(1)
+    return 0
+
+def failure_launch(workspace, size, executor, stream):
+    return 1
+
+q2, l2 = failure_query_type(failure_query), launch_type(failure_launch)
+assert api.fi_aclnn_register(b"launch-failure-fixture", b"fixture", C.cast(q2, C.c_void_p),
+                             C.cast(l2, C.c_void_p), 1, 1) == 0
+try:
+    torch.ops.flashinfer_aclnn._execute(
+        "launch-failure-fixture", [torch.ones(4).npu()], [torch.zeros(4).npu()])
+except RuntimeError:
+    pass
+else:
+    raise SystemExit("failed launch was accepted")
+torch.ones(4).npu()
+print("ADAPTER_CLEANUP_OK")
+'''
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code], cwd=ROOT,
+        env=dict(os.environ, FLASHINFER_ACLNN_ADAPTER_PATH=str(adapter)),
+        capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ADAPTER_CLEANUP_OK" in result.stdout

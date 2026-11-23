@@ -54,6 +54,8 @@ struct Binding {
     std::atomic<uint64_t> last_workspace_bytes{0};
     std::atomic<bool> workspace_observed{false};
     std::vector<int64_t> formats, conversions, optional, attributes;
+    // Additive exact-alias declarations, flattened as input/output index pairs.
+    std::vector<int64_t> aliases;
 
     Binding(std::string op_name, void* query, Launch run, size_t input_count, size_t output_count)
         : name(std::move(op_name)), workspace(query), launch(run), inputs(input_count),
@@ -196,7 +198,8 @@ void execute(const std::string& token, at::TensorList inputs, at::TensorList out
 // format, optional-input and attribute declarations from the verified recipe.
 void execute_attributes(const std::string& token,
                       const c10::List<c10::optional<at::Tensor>>& inputs,
-                      at::TensorList outputs, const std::vector<c10::IValue>& attributes) {
+                      at::TensorList outputs, const std::vector<c10::IValue>& attributes,
+                      bool strided_alias = false) {
     std::shared_ptr<Binding> binding;
     {
         std::lock_guard<std::mutex> lock(bindings_mutex);
@@ -221,21 +224,75 @@ void execute_attributes(const std::string& token,
     c10_npu::NPUGuard guard(device);
     const auto stream = c10_npu::getCurrentNPUStream(device.index());
     const auto raw_stream = stream.stream(true);
+    std::vector<bool> aliased(arguments.size(), false);
+    std::vector<int64_t> alias_source(arguments.size(), -1);
+    if (strided_alias) {
+        TORCH_CHECK(binding->aliases.size() % 2 == 0, "Invalid ACLNN alias declaration");
+        for (size_t pair = 0; pair < binding->aliases.size(); pair += 2) {
+            const int64_t source = binding->aliases[pair];
+            const int64_t output = binding->aliases[pair + 1];
+            TORCH_CHECK(source >= 0 && output >= static_cast<int64_t>(binding->inputs) &&
+                        output < static_cast<int64_t>(arguments.size()) && arguments[source] &&
+                        arguments[output], "Invalid ACLNN alias pair");
+            const auto& from = *arguments[source];
+            const auto& to = *arguments[output];
+            TORCH_CHECK(from.is_contiguous() == to.is_contiguous() && from.data_ptr() == to.data_ptr() &&
+                        from.storage().data_ptr() == to.storage().data_ptr() && from.sizes() == to.sizes() &&
+                        from.strides() == to.strides() && from.storage_offset() == to.storage_offset() &&
+                        from.scalar_type() == to.scalar_type(),
+                        "ACLNN alias pair must be the exact same storage view");
+            aliased[source] = true;
+            aliased[output] = true;
+            alias_source[output] = source;
+        }
+    }
     for (size_t i = 0; i < arguments.size(); ++i) {
         if (!arguments[i]) continue;
         const auto& tensor = *arguments[i];
         const auto format = at_npu::native::get_npu_format(tensor);
         const int64_t mask = format == ACL_FORMAT_ND ? 1 : format == ACL_FORMAT_FRACTAL_NZ ? 2 : 0;
-        TORCH_CHECK(tensor.device() == device && tensor.is_contiguous() &&
-                    (binding->formats[i] & mask), "ACLNN Tensor violates its declared device/format");
+        if (tensor.is_contiguous()) {
+            TORCH_CHECK(tensor.device() == device && (binding->formats[i] & mask),
+                        "ACLNN Tensor violates its declared device/format");
+        } else {
+            TORCH_CHECK(strided_alias && aliased[i] && format == ACL_FORMAT_ND &&
+                        (binding->formats[i] & mask),
+                        "ACLNN non-contiguous Tensor is not a declared strided alias");
+            const auto strides = tensor.strides();
+            TORCH_CHECK(!strides.empty() && strides[strides.size() - 1] == 1,
+                        "ACLNN strided alias requires a contiguous last axis");
+            int64_t span = tensor.storage_offset();
+            for (size_t dim = 0; dim < strides.size(); ++dim) {
+                TORCH_CHECK(tensor.size(dim) > 0 && strides[dim] >= 0,
+                            "ACLNN strided alias requires positive shapes and nonnegative strides");
+                if (tensor.size(dim) > 1) {
+                    TORCH_CHECK(strides[dim] > 0,
+                                "ACLNN strided alias requires positive strides on non-singleton axes");
+                    span += (tensor.size(dim) - 1) * strides[dim];
+                }
+            }
+            TORCH_CHECK(span >= 0 && static_cast<uint64_t>(span) <
+                        static_cast<uint64_t>(tensor.storage().nbytes() / tensor.element_size()),
+                        "ACLNN strided alias exceeds its storage span");
+            TORCH_CHECK(tensor.device() == device, "ACLNN Tensors must share one device");
+        }
         c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
     }
     for (size_t out = binding->inputs; out < arguments.size(); ++out) {
         const auto& tensor = *arguments[out];
         const auto lo = reinterpret_cast<uintptr_t>(tensor.data_ptr());
-        const auto hi = lo + tensor.nbytes();
+        uint64_t elements = 0;
+        if (tensor.numel() != 0) {
+            elements = 1;
+            for (size_t dim = 0; dim < tensor.dim(); ++dim) {
+                if (tensor.size(dim) > 1) {
+                    elements += static_cast<uint64_t>(tensor.size(dim) - 1) * tensor.stride(dim);
+                }
+            }
+        }
+        const auto hi = lo + elements * tensor.element_size();
         for (size_t i = 0; i < arguments.size(); ++i) {
-            if (i == out || !arguments[i]) continue;
+            if (i == out || !arguments[i] || alias_source[out] == static_cast<int64_t>(i)) continue;
             const auto& other = *arguments[i];
             auto begin = reinterpret_cast<uintptr_t>(other.data_ptr());
             auto bytes = other.nbytes();
@@ -262,6 +319,17 @@ void execute_attributes(const std::string& token,
             std::vector<int64_t> storage = format == ACL_FORMAT_FRACTAL_NZ
                 ? at_npu::native::get_npu_storage_sizes(tensor)
                 : std::vector<int64_t>{static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size())};
+            if (format == ACL_FORMAT_FRACTAL_NZ && tensor.dim() == 2 &&
+                tensor.scalar_type() == at::kChar) {
+                // INT8 NZ is physically [ceil(N/32), ceil(M/16), 16, 32].
+                // A transposed backing reinterpreted as the logical [K,N]
+                // view has the same element count but a different physical
+                // shape; reject it instead of silently changing the result.
+                const std::vector<int64_t> expected = {
+                    (tensor.size(1) + 31) / 32, (tensor.size(0) + 15) / 16, 16, 32};
+                TORCH_CHECK(storage == expected,
+                            "ACLNN INT8 FRACTAL_NZ storage shape does not match its logical orientation");
+            }
             auto dtype = acl_dtype(tensor.scalar_type());
             if (binding->conversions[i] == 1 && tensor.scalar_type() == at::kInt) {
                 TORCH_CHECK(!sizes.empty() && !storage.empty(), "Packed int4 requires dimensional metadata");
@@ -333,8 +401,22 @@ void execute_attributes(const std::string& token,
         return 0;
     };
     try { at_npu::native::OpCommand::RunOpApi(binding->name, call, true); }
-    catch (...) { state->release(); throw; }
+    catch (...) {
+        // A failed launch may already have submitted work. Drain it before
+        // releasing tensors/workspace, matching the mandatory-Tensor path.
+        aclrtSynchronizeStream(raw_stream);
+        state->release();
+        throw;
+    }
     TORCH_CHECK(state->release() == 0, "aclDestroyTensor failed");
+}
+
+void execute_strided_alias(const std::string& token,
+                           const c10::List<c10::optional<at::Tensor>>& inputs,
+                           at::TensorList outputs, const c10::List<c10::IValue>& attributes) {
+    std::vector<c10::IValue> values;
+    for (const auto& attribute : attributes) values.push_back(attribute);
+    execute_attributes(token, inputs, outputs, values, true);
 }
 } // namespace
 
@@ -415,6 +497,66 @@ extern "C" __attribute__((visibility("default"))) int fi_aclnn_register_extended
     } catch (const std::exception& error) { last_error = error.what(); return -1; }
 }
 
+extern "C" __attribute__((visibility("default"))) int fi_aclnn_register_strided_alias(
+    const char* token, const char* name, void* workspace, void* launch,
+    uint64_t inputs, uint64_t outputs, const int64_t* formats,
+    const int64_t* conversions, const int64_t* optional,
+    const int64_t* attributes, uint64_t attribute_count,
+    const int64_t* aliases, uint64_t alias_pair_count) noexcept {
+    try {
+        TORCH_CHECK(token && name && workspace && launch && formats && conversions && optional &&
+                    inputs && outputs && inputs + outputs < 1024 && attribute_count < 1024 &&
+                    (!attribute_count || attributes) && alias_pair_count && aliases &&
+                    alias_pair_count < 1024 / 2,
+                    "Invalid strided-alias ACLNN registration");
+        auto binding = std::make_shared<Binding>(name, workspace, reinterpret_cast<Launch>(launch), inputs, outputs);
+        binding->formats.assign(formats, formats + inputs + outputs);
+        binding->conversions.assign(conversions, conversions + inputs + outputs);
+        binding->optional.assign(optional, optional + inputs + outputs);
+        if (attribute_count) binding->attributes.assign(attributes, attributes + attribute_count);
+        binding->aliases.assign(aliases, aliases + alias_pair_count * 2);
+        binding->argument_types.clear();
+        for (size_t i = 0; i < inputs + outputs; ++i) {
+            TORCH_CHECK(formats[i] >= 1 && formats[i] <= 3 && conversions[i] >= 0 && conversions[i] <= 2 &&
+                        (optional[i] == 0 || optional[i] == 1) && (i < inputs || !optional[i]),
+                        "Invalid strided-alias ACLNN Tensor declaration");
+        }
+        std::vector<bool> seen_output(inputs + outputs, false);
+        for (size_t pair = 0; pair < alias_pair_count; ++pair) {
+            const int64_t source = binding->aliases[pair * 2];
+            const int64_t output = binding->aliases[pair * 2 + 1];
+            TORCH_CHECK(source >= 0 && source < static_cast<int64_t>(inputs) &&
+                        output >= static_cast<int64_t>(inputs) &&
+                        output < static_cast<int64_t>(inputs + outputs) && !seen_output[output] &&
+                        formats[source] == 1 && formats[output] == 1 && conversions[source] == 0 &&
+                        conversions[output] == 0 && optional[source] == 0,
+                        "Strided aliases require unique output/input pairs of physical ND Tensors");
+            seen_output[output] = true;
+        }
+        binding->argument_types.assign(inputs, &ffi_type_pointer);
+        for (auto type : binding->attributes) {
+            TORCH_CHECK(type >= 0 && type <= 3, "Invalid ACLNN attribute type");
+            binding->argument_types.push_back(type == 0 ? &ffi_type_uint8 : type == 1 ? &ffi_type_sint64 :
+                                             type == 2 ? &ffi_type_double : &ffi_type_pointer);
+        }
+        binding->argument_types.insert(binding->argument_types.end(), outputs + 2, &ffi_type_pointer);
+        TORCH_CHECK(ffi_prep_cif(&binding->workspace_signature, FFI_DEFAULT_ABI,
+                                binding->argument_types.size(), &ffi_type_uint32,
+                                binding->argument_types.data()) == FFI_OK, "Invalid strided-alias ACLNN signature");
+        std::lock_guard<std::mutex> lock(bindings_mutex);
+        auto previous = bindings.find(token);
+        if (previous != bindings.end()) {
+            const auto& prior = *previous->second;
+            TORCH_CHECK(prior.name == binding->name && prior.workspace == workspace && prior.launch == binding->launch &&
+                        prior.inputs == inputs && prior.outputs == outputs && prior.formats == binding->formats &&
+                        prior.conversions == binding->conversions && prior.optional == binding->optional &&
+                        prior.attributes == binding->attributes && prior.aliases == binding->aliases,
+                        "Cannot replace an immutable strided-alias ACLNN binding");
+        } else bindings.emplace(token, std::move(binding));
+        last_error.clear(); return 0;
+    } catch (const std::exception& error) { last_error = error.what(); return -1; }
+}
+
 // Diagnostics observe the actual native query without rerunning host tiling.
 extern "C" __attribute__((visibility("default"))) int fi_aclnn_last_workspace_size(
     const char* token, uint64_t* size) noexcept {
@@ -453,9 +595,11 @@ TORCH_LIBRARY(flashinfer_aclnn, m) {
     m.def("_execute(str token, Tensor[] inputs, Tensor(a!)[] outputs) -> ()");
     m.def("_execute_extended(str token, Tensor?[] inputs, Tensor(a!)[] outputs, Scalar[] attributes) -> ()");
     m.def("_execute_with_strings(str token, Tensor?[] inputs, Tensor(a!)[] outputs, Any[] attributes) -> ()");
+    m.def("_execute_strided_alias(str token, Tensor?[] inputs, Tensor(a!)[] outputs, Any[] attributes) -> ()");
 }
 TORCH_LIBRARY_IMPL(flashinfer_aclnn, PrivateUse1, m) {
     m.impl("_execute", TORCH_FN(execute));
     m.impl("_execute_extended", TORCH_FN(execute_extended));
     m.impl("_execute_with_strings", TORCH_FN(execute_with_strings));
+    m.impl("_execute_strided_alias", TORCH_FN(execute_strided_alias));
 }

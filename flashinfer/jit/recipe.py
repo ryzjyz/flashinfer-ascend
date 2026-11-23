@@ -79,6 +79,9 @@ class TensorParameter:
     shape_alternatives: Tuple[Tuple[Union[str, int], ...], ...] = ()
     native_conversions: Tuple[TensorDtypeConversion, ...] = ()
     optional_for_dtypes: Tuple[Tuple[int, str], ...] = ()
+    # Additive exact-alias declaration for mutation-only outputs. The named
+    # input and this output must share one storage view and independent strides.
+    alias_of: Optional[str] = None
 
     def __post_init__(self):
         if (not isinstance(self.name, str) or not _SYMBOL.fullmatch(self.name)
@@ -116,6 +119,10 @@ class TensorParameter:
                 or v[0] < 0 or v[1] not in _TENSOR_DTYPES for v in conditional)):
             raise SchemaError("conditional optional Tensor requires explicit operand dtype declarations")
         object.__setattr__(self, "optional_for_dtypes", conditional)
+        if self.alias_of is not None and (
+                self.role != "output" or not isinstance(self.alias_of, str)
+                or not _SYMBOL.fullmatch(self.alias_of)):
+            raise SchemaError("Tensor alias_of must name an input for an output parameter")
 
     def native_type(self, storage_dtype):
         return next((c.native_dtype for c in self.native_conversions if c.storage_dtype == storage_dtype), storage_dtype)
@@ -124,7 +131,7 @@ class TensorParameter:
         value = asdict(self)
         for name, default in (("optional", False), ("physical_layouts", ("ND",)),
                               ("shape_alternatives", ()), ("native_conversions", ()),
-                              ("optional_for_dtypes", ())):
+                              ("optional_for_dtypes", ()), ("alias_of", None)):
             if getattr(self, name) == default:
                 value.pop(name)
         return value
@@ -307,6 +314,19 @@ class _Recipe:
             raise SchemaError("v2 requires unique ordered tensor_parameters")
         if any(index >= len(parameters) for p in parameters for index, _ in p.optional_for_dtypes):
             raise SchemaError("conditional optional Tensor refers to an unknown operand")
+        alias_outputs = set()
+        for parameter in parameters:
+            if parameter.alias_of is None:
+                continue
+            aliased = next((p for p in parameters if p.name == parameter.alias_of), None)
+            if (aliased is None or aliased.role != "input"
+                    or aliased.dtype != parameter.dtype
+                    or aliased.shape != parameter.shape
+                    or aliased.shape_alternatives != parameter.shape_alternatives
+                    or aliased.physical_layouts != parameter.physical_layouts
+                    or parameter.name in alias_outputs):
+                raise SchemaError("Tensor alias_of must bind one matching input")
+            alias_outputs.add(parameter.name)
         # CANN-generated ACLNN APIs place input tensors before output tensors.
         roles = [p.role for p in parameters]
         if roles != sorted(roles):
@@ -350,7 +370,15 @@ class _Recipe:
     @property
     def extended_aclnn(self):
         return bool(self.attributes or any(p.optional or p.physical_layouts != ("ND",)
-                                         or p.native_conversions for p in self.tensor_parameters))
+                                         or p.native_conversions or p.alias_of
+                                         for p in self.tensor_parameters))
+
+    @property
+    def alias_pairs(self):
+        """Ordered (input index, output index) exact-alias declarations."""
+        indices = {p.name: i for i, p in enumerate(self.tensor_parameters)}
+        return tuple((indices[p.alias_of], i) for i, p in enumerate(self.tensor_parameters)
+                     if p.alias_of is not None)
 
     def validate_attributes(self, values=None):
         values = {} if values is None else dict(values)

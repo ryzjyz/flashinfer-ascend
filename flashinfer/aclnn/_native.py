@@ -154,24 +154,70 @@ def prepare(module, recipe):
                         for p in recipe.attributes
                     ]
                 )
-                status = api.fi_aclnn_register_extended(
-                    token.encode(),
-                    recipe.host_entry.encode(),
-                    workspace,
-                    launch,
-                    inputs,
-                    outputs,
-                    formats,
-                    conversions,
-                    optional,
-                    attribute_types,
-                    len(recipe.attributes),
-                )
-                operation = (
-                    torch.ops.flashinfer_aclnn._execute_with_strings
-                    if has_strings
-                    else torch.ops.flashinfer_aclnn._execute_extended
-                )
+                alias_pairs = recipe.alias_pairs
+                if alias_pairs:
+                    if not hasattr(api, "fi_aclnn_register_strided_alias"):
+                        raise RuntimeError(
+                            "ACLNN Torch adapter lacks the declared strided-alias ABI; "
+                            "rebuild the adapter"
+                        )
+                    if not hasattr(torch.ops.flashinfer_aclnn, "_execute_strided_alias"):
+                        raise RuntimeError(
+                            "ACLNN Torch adapter lacks the strided-alias execution entry; "
+                            "rebuild the adapter"
+                        )
+                    api.fi_aclnn_register_strided_alias.argtypes = [
+                        C.c_char_p,
+                        C.c_char_p,
+                        C.c_void_p,
+                        C.c_void_p,
+                        C.c_uint64,
+                        C.c_uint64,
+                        integer_pointer,
+                        integer_pointer,
+                        integer_pointer,
+                        integer_pointer,
+                        C.c_uint64,
+                        integer_pointer,
+                        C.c_uint64,
+                    ]
+                    api.fi_aclnn_register_strided_alias.restype = C.c_int
+                    flattened = array([index for pair in alias_pairs for index in pair])
+                    status = api.fi_aclnn_register_strided_alias(
+                        token.encode(),
+                        recipe.host_entry.encode(),
+                        workspace,
+                        launch,
+                        inputs,
+                        outputs,
+                        formats,
+                        conversions,
+                        optional,
+                        attribute_types,
+                        len(recipe.attributes),
+                        flattened,
+                        len(alias_pairs),
+                    )
+                    operation = torch.ops.flashinfer_aclnn._execute_strided_alias
+                else:
+                    status = api.fi_aclnn_register_extended(
+                        token.encode(),
+                        recipe.host_entry.encode(),
+                        workspace,
+                        launch,
+                        inputs,
+                        outputs,
+                        formats,
+                        conversions,
+                        optional,
+                        attribute_types,
+                        len(recipe.attributes),
+                    )
+                    operation = (
+                        torch.ops.flashinfer_aclnn._execute_with_strings
+                        if has_strings
+                        else torch.ops.flashinfer_aclnn._execute_extended
+                    )
             else:
                 status = api.fi_aclnn_register(
                     token.encode(),

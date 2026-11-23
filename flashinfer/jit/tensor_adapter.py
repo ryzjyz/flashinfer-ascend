@@ -16,17 +16,68 @@ def _dtype_name(tensor):
     return str(tensor.dtype).removeprefix("torch.")
 
 
-def _reject_output_overlap(parameters, tensors):
+def _span(tensor):
+    """Half-open [begin, end) storage-element span of a Tensor view."""
+    begin = tensor.data_ptr()
+    if tensor.numel() == 0:
+        return begin, begin
+    if not hasattr(tensor, "stride"):
+        return begin, begin + tensor.numel() * tensor.element_size()
+    elements = 1
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        if int(size) > 1:
+            elements += (int(size) - 1) * int(stride)
+    return begin, begin + elements * tensor.element_size()
+
+
+def _reject_output_overlap(parameters, tensors, aliases=None):
+    """Reject output overlap unless the exact declared input alias is supplied."""
+    aliases = aliases or {}
     for output_index, (parameter, output) in enumerate(zip(parameters, tensors)):
         if parameter.role != "output":
             continue
-        out_lo, out_hi = output.data_ptr(), output.data_ptr() + output.numel() * output.element_size()
+        out_lo, out_hi = _span(output)
         for tensor_index, tensor in enumerate(tensors):
             if tensor_index == output_index or tensor is None:
                 continue
-            lo, hi = tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size()
+            if aliases.get(output_index) == tensor_index:
+                continue
+            lo, hi = _span(tensor)
             if max(lo, out_lo) < min(hi, out_hi):
                 raise ValueError("output tensors must not overlap other arguments")
+
+
+def _alias_pairs(recipe):
+    return {output: source for source, output in recipe.alias_pairs}
+
+
+def _validate_alias_pair(source, output, source_name, output_name):
+    if (source.data_ptr() != output.data_ptr()
+            or source.untyped_storage().data_ptr() != output.untyped_storage().data_ptr()
+            or tuple(source.shape) != tuple(output.shape)
+            or tuple(source.stride()) != tuple(output.stride())
+            or source.storage_offset() != output.storage_offset()
+            or source.dtype != output.dtype):
+        raise ValueError(
+            "ACLNN alias pair %s/%s must be the exact same storage view"
+            % (source_name, output_name))
+
+
+def _validate_strided_cache(tensor, name):
+    strides = tuple(int(value) for value in tensor.stride())
+    if not strides or strides[-1] != 1 or any(value < 0 for value in strides):
+        raise ValueError(
+            "ACLNN strided alias %s requires a contiguous last axis and nonnegative strides" % name)
+    if any(int(size) > 1 and stride <= 0
+           for size, stride in zip(tensor.shape, strides)):
+        raise ValueError(
+            "ACLNN strided alias %s requires positive strides on non-singleton axes" % name)
+    span = tensor.storage_offset()
+    for size, stride in zip(tensor.shape, strides):
+        if int(size) > 1:
+            span += (int(size) - 1) * stride
+    if span >= tensor.untyped_storage().nbytes() // tensor.element_size():
+        raise ValueError("ACLNN strided alias %s exceeds its storage span" % name)
 
 
 def package_tensor_runner(module, recipe, *, spec):
@@ -76,14 +127,25 @@ class TorchOpPackageRunner:
             raise ValueError("Ascend C tensor adapter requires NPU tensors")
         if any(t.device != device for t in present):
             raise ValueError("Ascend C tensors must share one device")
-        for parameter, tensor in zip(self.recipe.tensor_parameters, tensors):
+        aliases = _alias_pairs(self.recipe)
+        parameters = self.recipe.tensor_parameters
+        for output_index, source_index in aliases.items():
+            _validate_alias_pair(tensors[source_index], tensors[output_index],
+                                 parameters[source_index].name, parameters[output_index].name)
+        allowed_strided = set(aliases) | set(aliases.values())
+        for index, (parameter, tensor) in enumerate(zip(parameters, tensors)):
             if tensor is None:
                 continue
             layout = {2: "ND", 29: "NZ"}.get(torch_npu.get_npu_format(tensor))
-            if not tensor.is_contiguous() or layout not in parameter.physical_layouts:
+            if layout not in parameter.physical_layouts:
+                raise ValueError("Ascend C tensor format violates its declared layout for %s"
+                                 % parameter.name)
+            if index in allowed_strided:
+                _validate_strided_cache(tensor, parameter.name)
+            elif not tensor.is_contiguous():
                 raise ValueError("Ascend C tensor adapter requires contiguous %s tensors for %s"
                                  % ("/".join(parameter.physical_layouts), parameter.name))
-        _reject_output_overlap(self.recipe.tensor_parameters, tensors)
+        _reject_output_overlap(parameters, tensors, aliases)
 
         from flashinfer.aclnn import _native
 

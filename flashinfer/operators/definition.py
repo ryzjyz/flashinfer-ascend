@@ -90,6 +90,9 @@ class OperatorDefinition:
     public_entry: object = None
     description: str = ""
     tensor_shapes: tuple = ()
+    # Rich operators own their Torch schema and mutation set explicitly so the
+    # capability fingerprint can bind the public contract.
+    torch_contract: tuple = ()
 
     def __post_init__(self):
         if (
@@ -103,6 +106,16 @@ class OperatorDefinition:
             and not callable(self.validate_values)
         ):
             raise SchemaError("invalid logical operator definition")
+        if self.torch_contract:
+            if (
+                not isinstance(self.torch_contract, tuple)
+                or len(self.torch_contract) != 2
+                or not isinstance(self.torch_contract[0], str)
+                or not self.torch_contract[0].startswith("(")
+                or not isinstance(self.torch_contract[1], tuple)
+                or any(not isinstance(name, str) or not name for name in self.torch_contract[1])
+            ):
+                raise SchemaError("torch_contract must be (schema, mutates_args)")
         if self.schema:
             declarations, returns = schema_arguments(self.schema)
             names = [name for _, name, _, _ in declarations]

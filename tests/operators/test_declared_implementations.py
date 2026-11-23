@@ -10,7 +10,9 @@ import flashinfer
 from flashinfer.operators.catalog import cases_module, definition, entries
 from flashinfer.operators.implementation import implementations
 from flashinfer.operators.pytest_support import aot_params, implementation_param
-from flashinfer.operators.testing import case_parameters, case_tolerances, numerical_cases
+from flashinfer.operators.testing import (
+    case_parameters, case_tolerances, is_void_mutation, numerical_cases, run_void_mutation,
+)
 from flashinfer.runtime import Backend, CompileMode, KernelRegistry, get_global_registry, kernel_registry_scope
 
 
@@ -32,6 +34,9 @@ def test_public_default_route(npu_runtime, aot_runtime, op, configuration):
         call = getattr(flashinfer, operator.name)
     cases = cases_module(op)
     args, options, expected = cases.sample(torch, torch_npu, **configuration)
+    if is_void_mutation(operator):
+        run_void_mutation(torch, call, cases, args, options, expected)
+        return
     actual = call(*args, **options)
     tolerances = case_tolerances(cases, configuration)
     if len(tolerances) == 1:
