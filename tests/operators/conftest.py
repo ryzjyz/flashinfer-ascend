@@ -22,8 +22,9 @@ def device_runtime():
 def npu_runtime(device_runtime):
     torch, torch_npu = device_runtime
     # TorchNPU exposes a setter here; its option API supplies the previous value.
+    # b"" means no explicit setting and can be restored exactly with "".
     previous = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")
-    assert previous in (b"enable", b"disable"), "cannot preserve the NPU internal-format option"
+    assert previous in (b"enable", b"disable", b""), "cannot preserve the NPU internal-format option"
     torch.npu.config.allow_internal_format = True
     try:
         yield torch, torch_npu
