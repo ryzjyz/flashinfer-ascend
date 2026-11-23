@@ -889,6 +889,15 @@ struct RopeScatterKernel {
         // Whole-token staging for the kHeads x kRopeDim rope slices: one strided
         // descriptor per token instead of one per 4-head batch. 64 * 64 * 2 = 8192 B.
         constexpr uint32_t kQRows = 12288;
+        // Staged Q-rope buffers: the kHeads/4 per-batch iterations are
+        // independent, so each dependency stage is issued for all heads back
+        // to back and only one PipeBarrier per stage is paid. Capacity is the
+        // kHeads * kRopeDim = 4096 element bound (16 KiB per fp32 buffer).
+        // Pure scheduling change: per element the Cast/Mul/Gather/
+        // FusedMulAdd/Cast chain and its operands are unchanged.
+        constexpr uint32_t kXAll = 20480;
+        constexpr uint32_t kOutAll = kXAll + kHeads * kRopeDim * sizeof(float);
+        constexpr uint32_t kRotAll = kOutAll + kHeads * kRopeDim * sizeof(float);
 
         Arch::Resource<Arch::AtlasA2> resource;
         AscendC::LocalTensor<bfloat16_t> rowLocal[2] = {
@@ -908,6 +917,9 @@ struct RopeScatterKernel {
         auto sign = resource.ubBuf.GetBufferByByte<float>(kSign);
         auto offsets = resource.ubBuf.GetBufferByByte<uint32_t>(kOffsets);
         auto qRows = resource.ubBuf.GetBufferByByte<bfloat16_t>(kQRows);
+        auto xAll = resource.ubBuf.GetBufferByByte<float>(kXAll);
+        auto outAll = resource.ubBuf.GetBufferByByte<float>(kOutAll);
+        auto rotAll = resource.ubBuf.GetBufferByByte<float>(kRotAll);
 
         AscendC::GlobalTensor<bfloat16_t> gmQ;
         AscendC::GlobalTensor<bfloat16_t> gmKv;
@@ -974,25 +986,35 @@ struct RopeScatterKernel {
             AscendC::Mul(sin, sin, sign, kBatchRope);
             AscendC::PipeBarrier<PIPE_V>();
 
+            // Q rope with one level-2 Cast and one level-0 broadcast
+            // Mul/FusedMulAdd over all heads (srcRepStride=0 reuses the
+            // token's 64 cos/sin values), and a per-4-head level-2 Gather
+            // (the level-0 Gather with a 64-repeat body is not usable on
+            // this device). API calls per token drop from 80 to 2 + 16 + 2.
+            const uint32_t ropeCount = kHeads * kRopeDim;
+            const uint64_t ropeMask = kRopeDim;
+            const uint8_t headRepeats = static_cast<uint8_t>(kHeads);
+            const uint16_t dstRepFp32 = 8U;
+            AscendC::BinaryRepeatParams mulParams(
+                1, 1, 1, dstRepFp32, dstRepFp32, 0);
+            AscendC::BinaryRepeatParams fmaParams(
+                1, 1, 1, dstRepFp32, 0, dstRepFp32);
+            AscendC::Cast(
+                xAll, qRows, AscendC::RoundMode::CAST_NONE, ropeCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(
+                outAll, xAll, cos, ropeMask, headRepeats, mulParams);
             for (uint32_t head = 0; head < kHeads; head += kHeadBatch) {
-                const uint32_t slot = (head / kHeadBatch) & 1U;
-                AscendC::LocalTensor<bfloat16_t> rows =
-                    qRows[(head / kHeadBatch) * kBatchRope];
-
-                AscendC::Cast(
-                    x[slot], rows,
-                    AscendC::RoundMode::CAST_NONE, kBatchRope);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(output[slot], x[slot], cos, kBatchRope);
-                AscendC::Gather(rotated[slot], x[slot], offsets, 0U, kBatchRope);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::FusedMulAdd(
-                    rotated[slot], sin, output[slot], kBatchRope);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(
-                    rows, rotated[slot],
-                    AscendC::RoundMode::CAST_RINT, kBatchRope);
+                const uint32_t batch = head / kHeadBatch;
+                const uint32_t base = batch * kBatchRope;
+                AscendC::Gather(rotAll[base], xAll[base], offsets, 0U, kBatchRope);
             }
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::FusedMulAdd(
+                rotAll, sin, outAll, ropeMask, headRepeats, fmaParams);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                qRows, rotAll, AscendC::RoundMode::CAST_RINT, ropeCount);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::DataCopy(
