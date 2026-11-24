@@ -51,6 +51,7 @@ constexpr uint64_t SYNC_AIC_TO_AIV = 5;
 constexpr uint64_t SYNC_ACTIVATION_READY = 9;
 constexpr uint64_t SYNC_W_READY = 10;
 constexpr uint32_t BUFFER_NUM = 2;
+constexpr uint32_t DQ_ROWS_PER_TILE = 4;
 
 struct MNConfig {
     uint32_t m = 0;
@@ -258,59 +259,72 @@ __aicore__ inline void QuantGroupMatmul<MT>::DynamicQuantRows(GlobalTensor<bfloa
     LocalTensor<float> scalar = pertokenBrcbLocal;
     LocalTensor<float> mx = scalar;
     LocalTensor<float> c127 = scalar[16];
+    LocalTensor<float> scaleOut = scalar[32];
     LocalTensor<uint8_t> workRM = actResultLocal.ReinterpretCast<uint8_t>();
-    const uint32_t rowShape[2] = {1, k};
+    constexpr uint32_t SCALE_SLOT_FLOATS = 8; // 32B: each DataCopyPad source block starts aligned
     Duplicate(c127, 127.0f, 8);
-    // scalar-review: batch-control; each AIV processes whole rows with vector APIs only
-    for (uint32_t row = firstRow; row < rows; row += totalVec) {
+    const uint32_t rowCount = firstRow < rows ? (rows - firstRow + totalVec - 1) / totalVec : 0;
+    // scalar-review: batch-control; four whole rows per tile, preserving the original row-to-AIV mapping
+    for (uint32_t tileRow = 0; tileRow < rowCount; tileRow += DQ_ROWS_PER_TILE) {
+        const uint32_t curRows = (rowCount - tileRow < DQ_ROWS_PER_TILE) ? rowCount - tileRow : DQ_ROWS_PER_TILE;
+        const uint32_t row = firstRow + tileRow * totalVec;
+        const uint32_t elems = curRows * k;
         LocalTensor<bfloat16_t> input = vecInQueue.AllocTensor<bfloat16_t>();
-        AscendC::DataCopyExtParams copyRow{1, static_cast<uint32_t>(k * sizeof(bfloat16_t)), 0, 0, 0};
+        const uint32_t srcRowGap = static_cast<uint32_t>((totalVec - 1) * k * sizeof(bfloat16_t));
+        AscendC::DataCopyExtParams copyRow{static_cast<uint16_t>(curRows),
+                                           static_cast<uint32_t>(k * sizeof(bfloat16_t)), srcRowGap, 0, 0};
         AscendC::DataCopyPadExtParams<bfloat16_t> padBf{false, 0, 0, 0};
         DataCopyPad(input, src[static_cast<uint64_t>(row) * k], copyRow, padBf);
         vecInQueue.EnQue(input);
         LocalTensor<bfloat16_t> inLocal = vecInQueue.DeQue<bfloat16_t>();
-        Cast(xF, inLocal, AscendC::RoundMode::CAST_NONE, k);
+        Cast(xF, inLocal, AscendC::RoundMode::CAST_NONE, elems);
         vecInQueue.FreeTensor(inLocal);
         AscendC::PipeBarrier<PIPE_V>();
 
-        Abs(qF, xF, k);
+        Abs(qF, xF, elems);
         AscendC::PipeBarrier<PIPE_V>();
+        const uint32_t rowShape[2] = {curRows, k};
         ReduceMax<float, AscendC::Pattern::Reduce::AR, false>(mx, qF, workRM, rowShape, true);
         AscendC::PipeBarrier<PIPE_V>();
-        LocalTensor<float> scaleOut = scalar[32];
         // Match standalone DynamicQuant: scale=127/amax, quant uses Muls,
         // and the published scale is the scalar reciprocal 1/scale.
-        Div(mx, c127, mx, 8);
+        Div(mx, c127, mx, curRows);
         const event_t scaleVs = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_S));
         AscendC::SetFlag<AscendC::HardEvent::V_S>(scaleVs);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(scaleVs);
-        const float scale = mx.GetValue(0);
-        const float publishedScale = 1.0f / scale;
-        Duplicate(scaleOut, publishedScale, 1);
-        Muls(qF, xF, scale, k);
+        // scalar-review: batch-control; retain the original per-row scalar reciprocal and Muls rounding order
+        for (uint32_t lane = 0; lane < curRows; ++lane) {
+            const float scale = mx.GetValue(lane);
+            const float publishedScale = 1.0f / scale;
+            Duplicate(scaleOut[lane * SCALE_SLOT_FLOATS], publishedScale, 1);
+            Muls(qF[lane * k], xF[lane * k], scale, k);
+        }
         AscendC::PipeBarrier<PIPE_V>();
 
         LocalTensor<int32_t> qI32 = qF.ReinterpretCast<int32_t>();
-        Cast(qI32, qF, AscendC::RoundMode::CAST_RINT, k);
+        Cast(qI32, qF, AscendC::RoundMode::CAST_RINT, elems);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetDeqScale((half)1.000000e+00f);
         LocalTensor<half> qHalf = qI32.ReinterpretCast<half>();
-        Cast(qHalf, qI32, AscendC::RoundMode::CAST_ROUND, k);
+        Cast(qHalf, qI32, AscendC::RoundMode::CAST_ROUND, elems);
         AscendC::PipeBarrier<PIPE_V>();
         LocalTensor<int8_t> qOut = vecOutQueue.AllocTensor<int8_t>();
-        Cast(qOut, qHalf, AscendC::RoundMode::CAST_TRUNC, k);
+        Cast(qOut, qHalf, AscendC::RoundMode::CAST_TRUNC, elems);
         AscendC::PipeBarrier<PIPE_V>();
         vecOutQueue.EnQue(qOut);
 
         LocalTensor<int8_t> qResult = vecOutQueue.DeQue<int8_t>();
-        AscendC::DataCopyExtParams copyQ{1, static_cast<uint32_t>(k * sizeof(int8_t)), 0, 0, 0};
-        AscendC::DataCopyExtParams copyScale{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
+        const uint32_t dstQRowGap = static_cast<uint32_t>((totalVec - 1) * k * sizeof(int8_t));
+        const uint32_t dstScaleRowGap = static_cast<uint32_t>((totalVec - 1) * sizeof(float));
+        AscendC::DataCopyExtParams copyQ{static_cast<uint16_t>(curRows), k, 0, dstQRowGap, 0};
+        AscendC::DataCopyExtParams copyScale{static_cast<uint16_t>(curRows),
+                                             static_cast<uint32_t>(sizeof(float)), 0, dstScaleRowGap, 0};
         DataCopyPad(dstQ[static_cast<uint64_t>(row) * k], qResult, copyQ);
         const int32_t scaleEvent = GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(scaleEvent);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(scaleEvent);
         DataCopyPad(dstScale[row], scaleOut, copyScale);
-        // qOut/scaleOut may be reused by the next row. V_MTE3 only orders
+        // qOut/scaleOut may be reused by the next tile. V_MTE3 only orders
         // production before the copy; MTE3_V is the consumed-completion edge
         // required before the Vector pipe overwrites or frees the UB slots.
         const int32_t copyBackEvent = GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_V);

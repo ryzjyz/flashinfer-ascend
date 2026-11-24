@@ -31,6 +31,7 @@ constexpr uint32_t K_ELEMS = 1280;
 constexpr uint32_t W_ELEMS = 32;
 constexpr uint32_t X_ELEMS = 5120;
 constexpr uint64_t TILING_KEY = 0;
+constexpr int64_t DQ_ROWS_PER_TILE = 4;
 
 bool GenerateQTiling(IndexerPrologueQWFullFusionTilingData& data, bool dense)
 {
@@ -69,7 +70,7 @@ bool GenerateQTiling(IndexerPrologueQWFullFusionTilingData& data, bool dense)
     return true;
 }
 
-bool GenerateWTiling(IndexerPrologueQWFullFusionTilingData& data)
+bool GenerateWTiling(IndexerPrologueQWFullFusionTilingData& data, uint32_t wCoreNum)
 {
     optiling::TCubeTiling tilingData;
     auto platform = platform_ascendc::PlatformAscendCManager::GetInstance();
@@ -77,7 +78,7 @@ bool GenerateWTiling(IndexerPrologueQWFullFusionTilingData& data)
         return false;
     }
     matmul_tiling::MultiCoreMatmulTiling tilingApi(*platform);
-    tilingApi.SetDim(data.get_coreNum());
+    tilingApi.SetDim(wCoreNum);
     tilingApi.SetAType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_BF16,
                        false);
     tilingApi.SetBType(matmul_tiling::TPosition::GM, matmul_tiling::CubeFormat::ND, matmul_tiling::DataType::DT_BF16,
@@ -293,14 +294,18 @@ ge::graphStatus TilingForQW(gert::TilingContext* context)
     data.set_wScale(*wScale);
     const uint32_t taskBlocks =
         ((tokens + BEST_BASE_M - 1) / BEST_BASE_M) * ((Q_ELEMS + BEST_BASE_N - 1) / BEST_BASE_N);
-    const uint32_t blockDim = std::min<uint32_t>(taskBlocks, static_cast<uint32_t>(coreNum));
+    const uint32_t taskCoreNum = std::min<uint32_t>(taskBlocks, static_cast<uint32_t>(coreNum));
+    // P0 dense-only: extra launch cores serve DQ/post on small dense shapes.
+    // The 16 Q tiles retain their core-0..15 mapping; W keeps its original width.
+    const uint32_t blockDim =
+        dense && tokens <= BEST_BASE_M ? static_cast<uint32_t>(coreNum) : taskCoreNum;
     data.set_coreNum(blockDim);
 
     uint32_t rmMax = 0;
     uint32_t rmMin = 0;
     uint32_t bcMax = 0;
     uint32_t bcMin = 0;
-    const ge::Shape reduceShape(std::vector<int64_t>{1, K_ELEMS});
+    const ge::Shape reduceShape(std::vector<int64_t>{DQ_ROWS_PER_TILE, K_ELEMS});
     AscendC::GetReduceMaxMaxMinTmpSize(reduceShape, ge::DT_FLOAT, AscendC::ReducePattern::AR, true, false, rmMax,
                                        rmMin);
     auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
@@ -308,7 +313,8 @@ ge::graphStatus TilingForQW(gert::TilingContext* context)
     const ge::Shape bcastSrc(std::vector<int64_t>{1, 1});
     const ge::Shape bcastDst(std::vector<int64_t>{1, K_ELEMS});
     AscendC::GetBroadCastMaxMinTmpSize(*platform, bcastSrc, bcastDst, sizeof(float), false, bcMax, bcMin);
-    OP_CHECK_IF(rmMin == 0 || rmMin + bcMin > 2 * 24 * BEST_BASE_N * sizeof(float),
+    const uint32_t dqWorkBytes = 24 * BEST_BASE_N * sizeof(float);
+    OP_CHECK_IF(rmMin == 0 || rmMin > dqWorkBytes || rmMin + bcMin > 2 * dqWorkBytes,
                 OP_LOGE(context->GetNodeName(), "invalid DQ temporary sizes %u/%u", rmMin, bcMin),
                 return ge::GRAPH_FAILED);
     data.set_dqReduceTmpBytes(rmMin);
@@ -316,7 +322,7 @@ ge::graphStatus TilingForQW(gert::TilingContext* context)
     data.set_denseLayout(dense ? 1 : 0);
     OP_CHECK_IF(!GenerateQTiling(data, dense), OP_LOGE(context->GetNodeName(), "failed to generate Q cube tiling"),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(!GenerateWTiling(data), OP_LOGE(context->GetNodeName(), "failed to generate W cube tiling"),
+    OP_CHECK_IF(!GenerateWTiling(data, taskCoreNum), OP_LOGE(context->GetNodeName(), "failed to generate W cube tiling"),
                 return ge::GRAPH_FAILED);
 
     context->SetBlockDim(blockDim);
