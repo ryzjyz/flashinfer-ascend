@@ -219,7 +219,13 @@ attributes = (AttributeParameter("layout_query", "string", "BSND"),
 recipe = replace(recipe, recipe_id="string_probe", kernel_id="test/string_probe",
                  package_op_type="FiStringProbe", host_entry="aclnnFiStringProbe", attributes=attributes)
 api = ctypes.CDLL(sys.argv[1])
-run = _native.prepare(SimpleNamespace(api=api), recipe)
+from csrc.cmake.operator.aclnn_adapter import torch_call
+from flashinfer.aclnn.build import build_package_call
+source = Path(sys.argv[1]).with_name("fi_aclnn_submit.cpp")
+source.write_text(torch_call(recipe.to_dict()))
+submit = source.with_suffix(".so")
+build_package_call(source, submit, Path.cwd())
+run = _native.prepare(SimpleNamespace(api=api, call_path=submit), recipe)
 tensors = tuple(torch.empty((16, 16), device="npu", dtype=torch.bfloat16) for _ in range(3))
 for _ in range(3):
     run(tensors, recipe.validate_attributes())
@@ -485,6 +491,7 @@ def project(tmp_path):
     (root / "csrc/recipes").mkdir()
     shutil.copyfile(ROOT / "csrc/CMakeLists.txt", root / "csrc/CMakeLists.txt")
     shutil.copytree(ROOT / "csrc/cmake", root / "csrc/cmake")
+    shutil.copytree(ROOT / "csrc/aclnn_torch_adapter", root / "csrc/aclnn_torch_adapter")
     return root, paths
 
 
@@ -643,22 +650,15 @@ def test_public_integration_points_have_no_operator_specific_glue():
         assert NAME not in (ROOT / "flashinfer" / name).read_text(), name
 
 
-def test_extra_build_contract_is_opt_in_and_roundtrips_without_changing_legacy_records():
-    from tests.support.legacy_ascendc import ROOT as LEGACY_ROOT, load_build_recipes
-
-    raw = json.loads((LEGACY_ROOT / "csrc/recipes/matmul_probe.json").read_text())
-    for declaration, original in zip(
-        load_build_recipes(LEGACY_ROOT / "csrc/recipes/matmul_probe.json"), raw
-    ):
-        assert json.loads(json.dumps(declaration.to_dict())) == original
-        with pytest.raises(SchemaError, match="hashed extra"):
-            replace(declaration, cmake_entry="untracked.cmake")
+def test_extra_build_contract_binds_its_cmake_inputs():
     current = BuildRecipe.from_dict(
         json.loads((recipe_root(ROOT) / (NAME + ".json")).read_text())[0]
     )
     assert BuildRecipe.from_dict(current.to_dict()) == current
     assert current.cmake_entry.endswith("/CMakeLists.txt")
     assert current.extra_build_files
+    with pytest.raises(SchemaError, match="hashed extra"):
+        replace(current, cmake_entry="untracked.cmake")
 
 
 def test_api_and_torch_schemas_derive_from_the_same_author_declaration():
@@ -725,6 +725,7 @@ def test_import_and_source_generation_work_without_torch_or_sdk():
 import sys
 sys.modules['torch'] = None
 sys.modules['torch_npu'] = None
+sys.modules['catlass'] = None
 import flashinfer
 from flashinfer.operators.authoring import generate
 assert callable(flashinfer.grouped_matmul_swiglu_quant)

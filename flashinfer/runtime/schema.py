@@ -37,6 +37,7 @@ class Backend(str, Enum):
     CANN = "cann"
     ASCENDC = "ascendc"
     TRITON = "triton"
+    CATLASS_DSL = "catlass_dsl"
     EXTERNAL = "external"
     CUSTOM = "custom"
     REFERENCE = "reference"

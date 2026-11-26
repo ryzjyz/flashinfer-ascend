@@ -83,7 +83,7 @@ torch.testing.assert_close(y.cpu(), expected)
 
 ### 源码环境准备
 
-源码构建使用 Python `>=3.9`。在仓库根目录执行下列命令前，激活已安装匹配 Torch/TorchNPU 的环境，并加载 CANN 提供的 `set_env.sh`。Ascend C 编译需要 CANN 开发工具、CMake、C++17 编译器和 libffi 头文件及库；[A5 环境模板](environment-a5.yml) 提供固定的软件依赖组合。
+源码构建使用 Python `>=3.9`。在仓库根目录执行下列命令前，激活已安装匹配 Torch/TorchNPU 的环境，并加载 CANN 提供的 `set_env.sh`。Ascend C 编译需要 CANN 开发工具、CMake 和 C++17 编译器。[A5 环境模板](environment-a5.yml) 提供固定的软件依赖组合。
 
 ```bash
 python -m pip install 'setuptools>=61,<81' wheel 'pytest>=8.3.2,<9'

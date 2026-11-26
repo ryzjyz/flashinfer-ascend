@@ -6,24 +6,22 @@ import json
 import os
 from pathlib import Path
 from threading import RLock
+from typing import NamedTuple
 
 _lock = RLock()
 _owners = {}
-_runners = {}
+
+
+class _Binding(NamedTuple):
+    module: object
+    library: object
+    run: object
 
 
 def adapter_directory():
     from flashinfer._resources import data_root
 
     return Path(os.environ.get("FLASHINFER_ACLNN_ADAPTER_PATH", data_root() / "aclnn"))
-
-
-def available():
-    """Compatibility query: native Torch execution is always required.
-
-    This does not probe whether the library is present; loading validates it.
-    """
-    return True
 
 
 def verified_adapter(directory=None):
@@ -55,6 +53,12 @@ def verified_adapter(directory=None):
         raise RuntimeError("ACLNN Torch adapter library must not be a symlink")
     if hashlib.sha256(library.read_bytes()).hexdigest() != record["sha256"]:
         raise RuntimeError("ACLNN Torch adapter library digest mismatch")
+    if record.get("submission") != "torch_npu_task_queue":
+        raise RuntimeError("ACLNN Torch adapter lacks queued submission; rebuild the adapter or the AOT wheel")
+    from .._resources import data_root, source_root
+    header = (source_root() or data_root() / "build") / "csrc/aclnn_torch_adapter/call.h"
+    if record.get("call_header_sha256") != hashlib.sha256(header.read_bytes()).hexdigest():
+        raise RuntimeError("ACLNN Torch adapter call ABI mismatch; rebuild the adapter")
     return library, manifest
 
 
@@ -66,23 +70,15 @@ def load_adapter():
     library, _ = verified_adapter()
     torch.ops.load_library(str(library))
     api = C.CDLL(str(library))
-    api.fi_aclnn_register.argtypes = [
-        C.c_char_p,
-        C.c_char_p,
-        C.c_void_p,
-        C.c_void_p,
-        C.c_uint64,
-        C.c_uint64,
-    ]
-    api.fi_aclnn_register.restype = C.c_int
+    api.fi_bind_package.argtypes = [C.c_char_p, C.c_void_p, C.c_void_p, C.c_void_p]
+    api.fi_bind_package.restype = C.c_int
     api.fi_aclnn_last_error.argtypes = []
     api.fi_aclnn_last_error.restype = C.c_char_p
-    if not hasattr(api, "fi_aclnn_last_workspace_size"):
-        raise RuntimeError(
-            "ACLNN Torch adapter is outdated; rebuild the adapter or the AOT wheel"
-        )
     api.fi_aclnn_last_workspace_size.argtypes = [C.c_char_p, C.POINTER(C.c_uint64)]
     api.fi_aclnn_last_workspace_size.restype = C.c_int
+    if hasattr(getattr(torch.utils, "_python_dispatch", None), "is_in_torch_dispatch_mode"):
+        from ..runtime import signature
+        signature._batch_format_query = (torch, torch.ops.flashinfer_aclnn._storage_formats.default)
     return api
 
 
@@ -91,170 +87,62 @@ def prepare(module, recipe):
     import ctypes as C
     import torch
 
-    inputs = sum(parameter.role == "input" for parameter in recipe.tensor_parameters)
-    outputs = len(recipe.tensor_parameters) - inputs
     token = recipe.fingerprint + ":" + str(id(module.api))
     with _lock:
-        if token not in _runners:
-            api = load_adapter()
-            workspace = C.cast(
-                getattr(module.api, recipe.host_entry + "GetWorkspaceSize"), C.c_void_p
-            )
-            launch = C.cast(getattr(module.api, recipe.host_entry), C.c_void_p)
-            if recipe.extended_aclnn:
-                if not hasattr(api, "fi_aclnn_register_extended"):
-                    raise RuntimeError(
-                        "ACLNN Torch adapter lacks the declared extended ABI; rebuild the adapter"
-                    )
-                integer_pointer = C.POINTER(C.c_int64)
-                api.fi_aclnn_register_extended.argtypes = [
-                    C.c_char_p,
-                    C.c_char_p,
-                    C.c_void_p,
-                    C.c_void_p,
-                    C.c_uint64,
-                    C.c_uint64,
-                    integer_pointer,
-                    integer_pointer,
-                    integer_pointer,
-                    integer_pointer,
-                    C.c_uint64,
-                ]
-                api.fi_aclnn_register_extended.restype = C.c_int
-                array = lambda values: (C.c_int64 * len(values))(*values)
-                formats = array(
-                    [
-                        sum({"ND": 1, "NZ": 2}[f] for f in p.physical_layouts)
-                        for p in recipe.tensor_parameters
-                    ]
-                )
-                conversions = array(
-                    [
-                        next(
-                            (
-                                {"int4": 1, "uint64": 2}[c.native_dtype]
-                                for c in p.native_conversions
-                            ),
-                            0,
-                        )
-                        for p in recipe.tensor_parameters
-                    ]
-                )
-                optional = array([p.optional for p in recipe.tensor_parameters])
-                has_strings = any(p.dtype == "string" for p in recipe.attributes)
-                if has_strings and not hasattr(
-                    torch.ops.flashinfer_aclnn, "_execute_with_strings"
-                ):
-                    raise RuntimeError(
-                        "ACLNN Torch adapter lacks string attributes; rebuild the adapter"
-                    )
-                attribute_types = array(
-                    [
-                        {"bool": 0, "int64": 1, "float64": 2, "string": 3}[p.dtype]
-                        for p in recipe.attributes
-                    ]
-                )
-                alias_pairs = recipe.alias_pairs
-                if alias_pairs:
-                    if not hasattr(api, "fi_aclnn_register_strided_alias"):
-                        raise RuntimeError(
-                            "ACLNN Torch adapter lacks the declared strided-alias ABI; "
-                            "rebuild the adapter"
-                        )
-                    if not hasattr(torch.ops.flashinfer_aclnn, "_execute_strided_alias"):
-                        raise RuntimeError(
-                            "ACLNN Torch adapter lacks the strided-alias execution entry; "
-                            "rebuild the adapter"
-                        )
-                    api.fi_aclnn_register_strided_alias.argtypes = [
-                        C.c_char_p,
-                        C.c_char_p,
-                        C.c_void_p,
-                        C.c_void_p,
-                        C.c_uint64,
-                        C.c_uint64,
-                        integer_pointer,
-                        integer_pointer,
-                        integer_pointer,
-                        integer_pointer,
-                        C.c_uint64,
-                        integer_pointer,
-                        C.c_uint64,
-                    ]
-                    api.fi_aclnn_register_strided_alias.restype = C.c_int
-                    flattened = array([index for pair in alias_pairs for index in pair])
-                    status = api.fi_aclnn_register_strided_alias(
-                        token.encode(),
-                        recipe.host_entry.encode(),
-                        workspace,
-                        launch,
-                        inputs,
-                        outputs,
-                        formats,
-                        conversions,
-                        optional,
-                        attribute_types,
-                        len(recipe.attributes),
-                        flattened,
-                        len(alias_pairs),
-                    )
-                    operation = torch.ops.flashinfer_aclnn._execute_strided_alias
+        if token in _owners:
+            return _owners[token].run
+        api = load_adapter()
+        # The store/release verifies the companion bytes together with the vendor package.
+        companion = C.CDLL(str(module.call_path), mode=C.RTLD_LOCAL)
+        identity = companion.fi_submit_identity
+        identity.argtypes, identity.restype = [], C.c_char_p
+        if identity() != recipe.fingerprint.encode("ascii"):
+            raise RuntimeError("ACLNN submission library does not match its verified recipe")
+        status = api.fi_bind_package(token.encode(), companion.fi_submit,
+                                     getattr(module.api, recipe.host_entry + "GetWorkspaceSize"),
+                                     getattr(module.api, recipe.host_entry))
+        if status:
+            raise RuntimeError(api.fi_aclnn_last_error().decode())
+        inputs = sum(p.role == "input" for p in recipe.tensor_parameters)
+        grouped = any(p.tensor_list or p.optional for p in recipe.tensor_parameters)
+        dtype_positions = tuple(i for i, attr in enumerate(recipe.attributes) if attr.dtype == "dtype")
+        uint64_positions = tuple(i for i, attr in enumerate(recipe.attributes) if attr.dtype == "uint64")
+        operation = torch.ops.flashinfer_aclnn._execute.default
+
+        def run(tensors, attributes=()):
+            if dtype_positions or uint64_positions:
+                attributes = list(attributes)
+                for i in dtype_positions:
+                    attributes[i] = getattr(torch, attributes[i])
+                for i in uint64_positions:
+                    if attributes[i] >= 1 << 63:
+                        attributes[i] -= 1 << 64  # IValue stores integers in a signed 64-bit slot.
+            if not grouped:
+                return operation(token, tensors[:inputs], tensors[inputs:], attributes, ())
+            flat_inputs, flat_outputs, widths = [], [], []
+            for p, value in zip(recipe.tensor_parameters, tensors):
+                dest = flat_inputs if p.role == "input" else flat_outputs
+                if value is None:
+                    widths.append(-1)
+                elif p.tensor_list:
+                    widths.append(len(value))
+                    dest.extend(value)
                 else:
-                    status = api.fi_aclnn_register_extended(
-                        token.encode(),
-                        recipe.host_entry.encode(),
-                        workspace,
-                        launch,
-                        inputs,
-                        outputs,
-                        formats,
-                        conversions,
-                        optional,
-                        attribute_types,
-                        len(recipe.attributes),
-                    )
-                    operation = (
-                        torch.ops.flashinfer_aclnn._execute_with_strings
-                        if has_strings
-                        else torch.ops.flashinfer_aclnn._execute_extended
-                    )
-            else:
-                status = api.fi_aclnn_register(
-                    token.encode(),
-                    recipe.host_entry.encode(),
-                    workspace,
-                    launch,
-                    inputs,
-                    outputs,
-                )
-                operation = torch.ops.flashinfer_aclnn._execute
-            if status:
-                raise RuntimeError(api.fi_aclnn_last_error().decode())
-            _owners[token] = module
+                    widths.append(1)
+                    dest.append(value)
+            return operation(token, flat_inputs, flat_outputs, attributes, widths)
 
-            def run(tensors, attributes=()):
-                args = (token, list(tensors[:inputs]), list(tensors[inputs:]))
-                return (
-                    operation(*args, list(attributes))
-                    if recipe.extended_aclnn
-                    else operation(*args)
-                )
-
-            _runners[token] = run
-        return _runners[token]
+        _owners[token] = _Binding(module, companion, run)
+        return run
 
 
-def execute(module, recipe, tensors):
-    return prepare(module, recipe)(tensors)
-
-
-def last_workspace_size(module, recipe):
+def last_workspace_size(binding, recipe):
     """Observe the last real GetWorkspaceSize result of a prepared binding."""
     import ctypes as C
 
     api = load_adapter()
     size = C.c_uint64()
-    token = recipe.fingerprint + ":" + str(id(module.api))
+    token = recipe.fingerprint + ":" + str(id(binding.module.api))
     if api.fi_aclnn_last_workspace_size(token.encode(), C.byref(size)):
         raise RuntimeError(api.fi_aclnn_last_error().decode())
     return size.value

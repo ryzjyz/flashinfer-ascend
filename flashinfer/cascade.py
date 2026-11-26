@@ -9,22 +9,18 @@ from __future__ import annotations
 
 from typing import Optional, Union
 
-from .runtime import (
-    Backend,
-    build_signature,
-    current_hardware,
-    dispatch,
-)
-from .runtime.runner import run_selected as _run_selected
+from .runtime import Backend, current_hardware
+from .runtime.runner import run_operator
 
 _OP_MERGE_STATE = "cascade.merge_state"
 
 
 def merge_states(v, s):
     """Merge stacked states with base-2 LSE; v [seq, states, heads, dim]."""
-    signature = build_signature("cascade.merge_states", (v, s))
-    decision = dispatch(signature, current_hardware(), backend=None)
-    return _run_selected(decision.kernel_id, v, s)
+    return run_operator(
+        "cascade.merge_states", (v, s),
+        hardware=current_hardware(),
+    )
 
 
 def merge_state(
@@ -76,14 +72,10 @@ def merge_state(
         raise ValueError(
             "merge_state: s 形状须为 (seq_len, num_heads)，与 v 前两维一致"
         )
-    signature = build_signature(
-        _OP_MERGE_STATE,
-        (v_a, s_a, v_b, s_b),
+    return run_operator(
+        _OP_MERGE_STATE, (v_a, s_a, v_b, s_b), backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
     )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    return _run_selected(decision.kernel_id, v_a, s_a, v_b, s_b)
 
 
 # Definitions and implementation choices are collected by the framework.

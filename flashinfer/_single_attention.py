@@ -9,7 +9,7 @@ from .attention.frontend import (
 from .attention.planner import AttentionFrameworkSession
 from .attention.reference import ReferenceAttentionExecutor, ReferenceTensor
 from .attention.schema import AttentionMode, AttentionPlanSpec
-from .runtime import build_signature, current_hardware, dispatch, get_global_registry
+from .runtime.runner import run_operator
 from .runtime.schema import SchemaError
 
 
@@ -130,12 +130,10 @@ def single_attention(mode, q, k, v, *, backend="auto", kv_layout="NHD",
         from .cann.attention import dense_attention
 
         return dense_attention(q, k, v, native=False, **options)
-    signature = build_signature(
+    return run_operator(
         "attention." + mode.value, (q, k, v), layouts=(kv_layout,) * 3,
-        specializations={"head_dim": q.shape[-1]},
+        specializations={"head_dim": q.shape[-1]}, backend=policy, attributes=options,
     )
-    decision = dispatch(signature, current_hardware(), backend=policy)
-    return get_global_registry().get(decision.kernel_id).runner(q, k, v, **options)
 
 
 def run_single_jit(mode, jit_module, q, k, v, args, *, kv_layout="NHD",

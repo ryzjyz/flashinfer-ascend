@@ -26,4 +26,4 @@ dependencies:
       - msguard
       - opentelemetry-exporter-otlp-proto-grpc==1.33.1
       - opentelemetry-exporter-otlp-proto-http==1.33.1
-      - -e .
+      - -e .[catlass-dsl]

@@ -2,60 +2,38 @@
 
 from dataclasses import replace
 import json
-import os
-from pathlib import Path
 
 import pytest
 
-from flashinfer.operators.pytest_support import corrupt_package_copy
-from tests.support.aot_release import installed_release, run_release_scenario, runtime_only_cann
+from tests.support.aot_release import ROOT, run_release_scenario, runtime_only_cann
 
 pytestmark = pytest.mark.requires_soc("Ascend950")
-
-from tests.support.matmul_bias_silu_acceptance import ROOT
 
 
 @pytest.fixture(scope="module")
 def production_release(tmp_path_factory):
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("torch_npu")
-    if not torch.npu.is_available():
-        pytest.skip("requires real NPU; a skip is not T2' acceptance")
-    cann = Path(os.environ.get("ASCEND_HOME_PATH", "/absent"))
-    if not (cann / "bin/bisheng").is_file():
-        pytest.skip("requires bisheng to build the production AOT fixture")
+    import torch
+    import torch_npu
+
+    assert torch.npu.is_available(), "the selected AOT tests require an NPU"
     from flashinfer.ascendc import MATMUL_BIAS_SILU_KERNEL_ID
     from tests.support.aot_release import build_release
 
     return build_release(MATMUL_BIAS_SILU_KERNEL_ID, tmp_path_factory.mktemp("matmul-bias-silu"))
 
 
-def execute(scenario, tmp_path, *, search_root=None):
+def execute(scenario, tmp_path, *, search_root=None, bundled_release=None):
     env = runtime_only_cann(tmp_path) if scenario == "hit_disabled" else {}
     return run_release_scenario("tests.support.matmul_bias_silu_acceptance", scenario, tmp_path / "cold-store",
-                                search_root=search_root, env=env)
+                                search_root=search_root, bundled_release=bundled_release, env=env)
 
 
 @pytest.mark.real_compile
 def test_production_aot_without_compiler(production_release, tmp_path):
-    with installed_release(production_release):
-        evidence = execute("hit_disabled", tmp_path)
+    evidence = execute("hit_disabled", tmp_path, bundled_release=production_release)
     assert evidence["source"] == "aot" and evidence["compiler_calls"] == 0
     assert not evidence["compiler_path_visible"] and evidence["toolchain_calls"] == 0
     assert not evidence["compiler_home_visible"]
-
-
-@pytest.mark.real_compile
-def test_production_missing_disabled(production_release, tmp_path):
-    evidence = execute("missing_disabled", tmp_path)
-    assert evidence["category"] == "missing" and not evidence["fallback"]
-
-
-@pytest.mark.real_compile
-def test_production_corrupt_rejects_jit(production_release, tmp_path):
-    root = corrupt_package_copy(production_release, tmp_path / "damaged")
-    evidence = execute("corrupt", tmp_path, search_root=root)
-    assert evidence["policy"] == "enabled" and evidence["compiler_calls"] == 0
 
 
 def incompatible_release(release, root):

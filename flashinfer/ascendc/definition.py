@@ -155,7 +155,7 @@ class AscendCImplementation(ImplementationDefinition):
             ShapeConstraint(n, d.minimum, d.maximum, d.multiple_of)
             for n, d in support.dimensions.items()
         )
-        if operator.schema:
+        if operator.schema or operator.torch_declarations is not None:
             from flashinfer.operators.capability import direct_operator_binding
 
             metadata.setdefault("capability_binding", direct_operator_binding(

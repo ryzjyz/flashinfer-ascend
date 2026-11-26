@@ -164,6 +164,6 @@ print(cap.to_dict())
 
 普通 wheel 按本地芯片选择交付分组；910B 包含 A2/A3 的各自目标，950 包含 A5 目标，包名分别为 `flashinfer_ascend910b`、`flashinfer_ascend950`。`FLASHINFER_AOT_ALL=1`、`FLASHINFER_AOT_CONFIG`、`FLASHINFER_AOT_PREBUILT` 互斥；`FLASHINFER_AOT_ALL=0` 是源码模式。源码模式不提供 AOT-only 二进制。PREBUILT 仍校验产物和桥的身份，原生登记仅保留实际交付项。
 
-构建依赖包括匹配的 CANN/Torch/TorchNPU 头文件与库、编译器及 libffi；CATLASS 声明钉定 revision，头树由构建方提供。安装后执行仍需要相应运行栈，框架不隐式安装依赖。代码：[aot_mode](../../setup.py#L20)、[BuildPy](../../setup.py#L90)、[pyproject.toml](../../pyproject.toml)。
+构建依赖包括匹配的 CANN/Torch/TorchNPU 头文件与库、C++17 编译器。CATLASS 声明钉定 revision，头树由构建方提供。安装后执行仍需要相应运行栈，框架不隐式安装依赖。代码：[aot_mode](../../setup.py#L20)、[BuildPy](../../setup.py#L90)、[pyproject.toml](../../pyproject.toml)。
 
 相关说明：[文档导航](../README.md)、[规划与差距](../roadmap.md)。

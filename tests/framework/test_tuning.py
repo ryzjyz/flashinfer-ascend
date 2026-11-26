@@ -172,6 +172,16 @@ def test_path_switch_does_not_reuse_old_dispatch_decision(local_db, monkeypatch,
     assert dispatch(SIG, HW, registry=registry).kernel_id == A
 
 
+def test_relative_default_tuning_path_tracks_current_directory(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLASHINFER_NPU_TUNING_DB", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", "cache")
+    for name in ("first", "second"):
+        work = tmp_path / name
+        work.mkdir()
+        monkeypatch.chdir(work)
+        assert STORE.tuning_cache_token()[0] == str(work / "cache" / "flashinfer" / "tuning.sqlite3")
+
+
 @pytest.mark.parametrize("signature,hardware", [
     (replace(SIG, op="other"), HW),
     (replace(SIG, dtypes=("float16",)), HW),

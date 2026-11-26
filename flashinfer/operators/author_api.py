@@ -122,6 +122,7 @@ class PythonKernel:
     """Python device source relative to its implementation directory."""
 
     file: str = "kernels.py"
+    language: str = "triton"
 
     def source_ref(self, directory, package):
         path = directory / self.file
@@ -134,7 +135,7 @@ class PythonKernel:
                 "kernel source must be a regular implementation-local file"
             )
         return SourceRef(
-            "triton",
+            self.language,
             path.relative_to(package).as_posix(),
             hashlib.sha256(path.read_bytes()).hexdigest(),
         )
@@ -209,7 +210,7 @@ class PythonImplementation(ImplementationDefinition):
             metadata["source"] = self.source.source_ref(
                 self.directory, Path(__file__).resolve().parents[1]
             )
-        if self.BACKEND == Backend.TRITON:
+        if self.BACKEND in (Backend.TRITON, Backend.CATLASS_DSL):
             metadata.setdefault("compile_mode", CompileMode.JIT)
         value = KernelDescriptor(
             self.kernel_id,
@@ -218,7 +219,7 @@ class PythonImplementation(ImplementationDefinition):
             capability=self.support.capability(self.operator),
             **metadata
         )
-        if self.operator.schema and value.capability_binding is None:
+        if (self.operator.schema or self.operator.torch_declarations is not None) and value.capability_binding is None:
             from .capability import direct_operator_binding
 
             value = replace(value, capability_binding=direct_operator_binding(
@@ -242,6 +243,10 @@ class CANNImplementation(PythonImplementation):
 
 class TritonImplementation(PythonImplementation):
     BACKEND = Backend.TRITON
+
+
+class CatlassDslImplementation(PythonImplementation):
+    BACKEND = Backend.CATLASS_DSL
 
 
 class ReferenceImplementation(PythonImplementation):

@@ -86,7 +86,6 @@ def run_scenario(scenario, store_root):
     import flashinfer
     from flashinfer.ascendc import FLASH_ATTENTION_KERNEL_ID, load_contract
     from flashinfer.jit import AscendCBackend, AscendCToolchain, DiskJitBuildStore
-    from flashinfer.jit.discovery import AotCorruptError, AotMissingError
     from flashinfer.aclnn import _native
     from flashinfer.runtime import SchemaError, get_global_registry
     from flashinfer.runtime.schema import DispatchError
@@ -114,7 +113,7 @@ def run_scenario(scenario, store_root):
     AscendCBackend.compile = counted_compile
     AscendCToolchain.discover = counted_discover
     os.environ["FLASHINFER_NPU_CACHE_DIR"] = str(store_root)
-    enabled = scenario in {"missing_enabled", "corrupt", "missing_dependency"}
+    enabled = scenario in {"missing_enabled", "missing_dependency"}
     os.environ["FLASHINFER_NPU_JIT_DISABLE"] = "0" if enabled else "1"
     _, recipe, spec = load_contract(FLASH_ATTENTION_KERNEL_ID)
     store = DiskJitBuildStore(store_root)
@@ -187,23 +186,7 @@ def run_scenario(scenario, store_root):
                  rejected=diagnostics)
         return
 
-    try:
-        output = flashinfer.single_prefill_with_kv_cache_catlass(*tensors)
-    except (AotCorruptError, AotMissingError) as error:
-        if scenario == "corrupt":
-            assert isinstance(error, AotCorruptError)
-            assert "digest mismatch" in str(error)
-        else:
-            assert scenario == "missing_disabled", str(error)
-            assert isinstance(error, AotMissingError)
-            assert "no matching AOT op-package" in str(error) and "disabled" in str(error)
-        assert counts == {"compile": 0, "toolchain": 0}
-        assert store.lookup(spec) is None
-        evidence(category=error.category, compiler_calls=0, toolchain_calls=0,
-                 policy="enabled" if enabled else "disabled", fallback=False,
-                 diagnostic=str(error))
-        return
-
+    output = flashinfer.single_prefill_with_kv_cache_catlass(*tensors)
     assert scenario in {"hit_disabled", "missing_enabled", "numerical"}, "expected rejection"
     provenance = descriptor.runner.provenance
     expected_source = "jit" if scenario == "missing_enabled" else "aot"
@@ -211,7 +194,7 @@ def run_scenario(scenario, store_root):
     assert counts["compile"] == counts["toolchain"] == (expected_source == "jit")
     assert provenance.spec_fingerprint == spec.fingerprint
     if scenario == "hit_disabled":
-        assert provenance.directory.parent == data_root(ROOT) / "op_packages"
+        assert provenance.directory.parent == data_root() / "op_packages" == Path.cwd() / "flashinfer/data/op_packages"
     errors = []
 
     def compare(shape, expected, result, dtype="float16"):

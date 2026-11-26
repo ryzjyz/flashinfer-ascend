@@ -39,7 +39,7 @@ class CompatibilityReport:
 class ImplementationStack:
     """同一来源的只读登记视图；不携带 capability 或额外的排序策略。
 
-    ``stack_id`` 跨 op 稳定：内置来源为 cann / ascendc / triton /
+    ``stack_id`` 跨 op 稳定：内置来源为 cann / ascendc / triton / catlass_dsl /
     reference / custom；外部仓为 ``external:<仓库命名空间>``。历史
     ACLNN 与 CANN 合栈，Ascend C 的 AOT/JIT 合栈，编译方式不改变来源。
     ``descriptors`` 可由 ``KernelRegistry.stacks(op=...)`` 限定到某个 op。
@@ -54,6 +54,7 @@ _BUILTIN_STACK_IDS = {
     Backend.CANN: "cann", Backend.ACLNN: "cann",
     Backend.ASCENDC: "ascendc", Backend.ASCENDC_AOT: "ascendc",
     Backend.ASCENDC_JIT: "ascendc", Backend.TRITON: "triton",
+    Backend.CATLASS_DSL: "catlass_dsl",
     Backend.REFERENCE: "reference", Backend.CUSTOM: "custom",
 }
 
@@ -63,6 +64,7 @@ class KernelRegistry:
 
     def __init__(self, descriptors: Iterable[KernelDescriptor] = ()) -> None:
         self._descriptors: Dict[str, KernelDescriptor] = {}
+        self._operator_runner_profiles = {}
         self._frozen = False
         # 注册计数：dispatch 决策缓存 key 的组成部分，注册变化自动使旧缓存失效
         self._revision = 0

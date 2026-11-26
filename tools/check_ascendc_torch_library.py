@@ -190,9 +190,8 @@ def main():
 
     check_artifact(prepare, TorchOpPackageRunner)
     from flashinfer.aclnn import _native
-    if _native.available():
-        assert len(_native._owners) == 1
-        print("ACLNN_BRIDGE PASS native=True", flush=True)
+    assert len(_native._owners) == 1
+    print("ACLNN_BRIDGE PASS native=True", flush=True)
 
 
 if __name__ == "__main__":

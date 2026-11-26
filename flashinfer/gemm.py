@@ -16,13 +16,16 @@ from __future__ import annotations
 
 from typing import Optional, Tuple, Union
 
+from . import _matmul
+from .jit.tensor_adapter import _reject_output_overlap
 from .runtime import (
     Backend,
     build_signature,
     current_hardware,
     dispatch,
 )
-from .runtime.runner import run_selected as _run_selected
+from .runtime.runner import resolve_operator_runner, run_operator, run_selected as _run_selected
+from .runtime.signature import with_nd_output
 
 _OP_BMM_FP8 = "gemm.bmm_fp8"
 _OP_GEMM_FP8_NT_GROUPWISE = "gemm.gemm_fp8_nt_groupwise"
@@ -74,15 +77,11 @@ def bmm_fp8(
         out = torch.empty(
             A.shape[0], A.shape[1], B.shape[2], device=A.device, dtype=dtype
         )
-    signature = build_signature(
-        _OP_BMM_FP8,
-        (A, B, A_scale, B_scale),
-        specializations={"dtype": _dtype_name(dtype)},
+    run_operator(
+        _OP_BMM_FP8, (A, B, A_scale, B_scale), (A, B, A_scale, B_scale, out),
+        specializations={"dtype": _dtype_name(dtype)}, backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
     )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(decision.kernel_id, A, B, A_scale, B_scale, out)
     return out
 
 
@@ -143,26 +142,11 @@ def gemm_fp8_nt_groupwise(
             a.shape[0], b.shape[0],
             device=a.device, dtype=out_dtype or torch.bfloat16,
         )
-    signature = build_signature(
-        _OP_GEMM_FP8_NT_GROUPWISE,
-        (a, b, a_scale, b_scale),
-        specializations={
-            "scale_major_mode": str(scale_major_mode),
-            "scale_granularity_mnk": str(tuple(scale_granularity_mnk)),
-        },
-    )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(
-        decision.kernel_id,
-        a,
-        b,
-        a_scale,
-        b_scale,
-        str(scale_major_mode),
-        tuple(scale_granularity_mnk),
-        out,
+    run_operator(
+        _OP_GEMM_FP8_NT_GROUPWISE, (a, b, a_scale, b_scale),
+        (a, b, a_scale, b_scale, str(scale_major_mode), tuple(scale_granularity_mnk), out),
+        specializations={'scale_major_mode': str(scale_major_mode), 'scale_granularity_mnk': str(tuple(scale_granularity_mnk))},
+        backend=backend, kernel_id=kernel_id, hardware=current_hardware(),
     )
     return out
 
@@ -185,7 +169,8 @@ def matmul(
     ``backend`` is ``cann``, ``ascendc``, ``triton`` or ``auto``. Auto consumes
     valid tuning records, then the configured deterministic ordering.
     Ascend C requires an installed AOT package and never falls back to JIT.
-    This is synchronous eager execution, without a graph-capture promise.
+    Eager execution submits to the caller's current NPU stream. Use stream
+    ordering or an event before consuming the result on another stream.
     """
     import torch
     from .aclnn._ops import ensure_registered
@@ -200,33 +185,25 @@ def matmul(
 
 
 def _matmul_impl(a, b, out=None, *, backend=None, kernel_id=None):
-    import torch
-    from dataclasses import replace
-    from ._matmul import OP, metadata_reason, output_metadata, overlap_parameters
-    from .jit.tensor_adapter import _reject_output_overlap
+    prospective = out if out is not None else _matmul.output_metadata(a, b)
 
-    # infershape output
-    prospective = output_metadata(a, b, out)
-    signature = build_signature(
-        OP, (a, b) if out is None else (a, b, out),
-        specializations={"tensor_contract": metadata_reason(a, b, prospective),
-                         **({"tensor_contiguity": "0"} if any(not t.is_contiguous() for t in (a, b, prospective)) else {})},
+    def request():
+        facts = {"tensor_contract": _matmul.metadata_reason(a, b, prospective)}
+        if not (a.is_contiguous() and b.is_contiguous() and prospective.is_contiguous()):
+            facts["tensor_contiguity"] = "0"
+        sig = build_signature(_matmul.OP, (a, b) if out is None else (a, b, out),
+                              specializations=facts)
+        return with_nd_output(sig, sig.dtypes[0], prospective.shape) if out is None else sig
+
+    _, runner = resolve_operator_runner(
+        _matmul.OP, (a, b, out), None, request, hardware=current_hardware(),
+        backend=backend, kernel_id=kernel_id, select=dispatch, fallback=_run_selected,
     )
     if out is None:
-        signature = replace(
-            signature, dtypes=signature.dtypes + (str(a.dtype).removeprefix("torch."),),
-            shapes=signature.shapes + (prospective.shape,),
-            layouts=signature.layouts + ("",),
-            physical_layouts=tuple(
-                signature.physical_layouts[i] if i < len(signature.physical_layouts) else ""
-                for i in range(2)
-            ) + ("ND",),
-        )
-    decision = dispatch(signature, current_hardware(), backend=backend, kernel_id=kernel_id)
-    if out is None:
+        import torch
         out = torch.empty(prospective.shape, dtype=a.dtype, device=a.device)
-    _reject_output_overlap(overlap_parameters(), (a, b, out))
-    _run_selected(decision.kernel_id, a, b, out)
+    _reject_output_overlap(_matmul.overlap_parameters(), (a, b, out))
+    runner(a, b, out)
     return out
 
 
@@ -257,7 +234,6 @@ def matmul_bias_silu(
 def _matmul_bias_silu_impl(a, b, bias, out=None, *, backend="auto", kernel_id=None):
     """PrivateUse1 implementation shared by the functional and out schemas."""
     import torch
-    from dataclasses import replace
     from types import SimpleNamespace
     from ._matmul import metadata_reason
 
@@ -272,35 +248,30 @@ def _matmul_bias_silu_impl(a, b, bias, out=None, *, backend="auto", kernel_id=No
         )
     else:
         output_metadata = out
-    tensors = (a, b, bias, output_metadata)
-    signature = build_signature(
-        "gemm.matmul_bias_silu", tensors if out is not None else tensors[:3],
-        specializations={"tensor_contract": metadata_reason(a, b, output_metadata) if tuple(bias.shape) == (b.shape[1],)
-                             else "bias must have shape [N]"},
+    op = "gemm.matmul_bias_silu"
+
+    def request():
+        reason = (metadata_reason(a, b, output_metadata) if tuple(bias.shape) == (b.shape[1],)
+                  else "bias must have shape [N]")
+        tensors = (a, b, bias) if out is None else (a, b, bias, out)
+        sig = build_signature(op, tensors, specializations={"tensor_contract": reason})
+        return with_nd_output(sig, "bfloat16", output_metadata.shape) if out is None else sig
+
+    _, runner = resolve_operator_runner(
+        op, (a, b, bias, out), None, request, hardware=current_hardware(), backend=backend,
+        kernel_id=kernel_id, select=dispatch, fallback=_run_selected,
     )
     if out is None:
-        signature = replace(
-            signature, dtypes=signature.dtypes + ("bfloat16",),
-            shapes=signature.shapes + (output_metadata.shape,),
-            layouts=signature.layouts + ("",),
-            physical_layouts=tuple(
-                signature.physical_layouts[index]
-                if index < len(signature.physical_layouts) else ""
-                for index in range(3)
-            ) + ("ND",),
-        )
-    decision = dispatch(signature, current_hardware(), backend=backend, kernel_id=kernel_id)
-    if out is None:
         out = torch.empty(output_metadata.shape, dtype=torch.bfloat16, device=a.device)
-    _run_selected(decision.kernel_id, a, b, bias, out)
+    runner(a, b, bias, out)
     return out
 
 
 def _run(op, tensors, specializations, args, backend, kernel_id):
-    signature = build_signature(op, tensors, specializations=specializations)
-    decision = dispatch(signature, current_hardware(), backend=backend, kernel_id=kernel_id)
-
-    return _run_selected(decision.kernel_id, *args)
+    return run_operator(
+        op, tensors, args, specializations=specializations, backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
+    )
 
 
 def mm_bf16(

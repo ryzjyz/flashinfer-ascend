@@ -93,6 +93,7 @@ class OperatorDefinition:
     # Rich operators own their Torch schema and mutation set explicitly so the
     # capability fingerprint can bind the public contract.
     torch_contract: tuple = ()
+    torch_declarations: object = None
 
     def __post_init__(self):
         if (
@@ -116,6 +117,10 @@ class OperatorDefinition:
                 or any(not isinstance(name, str) or not name for name in self.torch_contract[1])
             ):
                 raise SchemaError("torch_contract must be (schema, mutates_args)")
+        if self.torch_declarations is not None and (
+            self.schema or not self.public_entry or not callable(self.torch_declarations)
+        ):
+            raise SchemaError("custom Torch declarations require a public entry and cannot also generate a schema")
         if self.schema:
             declarations, returns = schema_arguments(self.schema)
             names = [name for _, name, _, _ in declarations]

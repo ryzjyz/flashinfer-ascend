@@ -1,116 +1,92 @@
-"""P0-2 real CANN acceptance: public API -> dispatch -> AOT/JIT -> NPU."""
+"""Check immutable AOT generations and missing host symbols using the shipped Matmul."""
 
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 
 import pytest
 
-from flashinfer.operators.pytest_support import corrupt_package_copy
-from tests.support.aot_release import installed_release, run_release_scenario
-
-pytestmark = pytest.mark.requires_soc("Ascend950")
-
-from tests.support.aot_runtime_probe import build_release
+from flashinfer._matmul import AOT_KERNEL_ID
+from flashinfer.ascendc import load_contract
+from flashinfer.jit import DiskJitBuildStore
+from flashinfer.jit.discovery import AotPackageIndex
+from flashinfer.operators.pytest_support import prepare_release
 
 
 @pytest.fixture(scope="module")
-def real_release(tmp_path_factory):
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("torch_npu")
-    if not torch.npu.is_available():
-        pytest.skip("requires a real NPU; skips are not P0-2 acceptance")
-    cann = Path(os.environ.get("ASCEND_HOME_PATH", "/absent"))
-    if not (cann / "bin/bisheng").is_file():
-        pytest.skip("requires bisheng to prepare the real AOT release")
-    return build_release(tmp_path_factory.mktemp("p0-2-aot"))
-
-
-def execute(scenario, release, tmp_path, *, search_root=None, second_release=None):
-    arguments = [release, tmp_path / "cold-runtime-store"]
-    if second_release is not None:
-        arguments.append(second_release)
-    return run_release_scenario("tests.support.aot_runtime_probe", scenario, *arguments,
-                                search_root=search_root, timeout=180)
+def matmul_release(tmp_path_factory):
+    env = prepare_release("matmul", tmp_path_factory.mktemp("runtime-aot"), kernel_id=AOT_KERNEL_ID)
+    descriptor, _, spec = load_contract(AOT_KERNEL_ID)
+    index = AotPackageIndex((Path(env["FLASHINFER_AOT_PATHS"]),))
+    return env, index.find(spec, descriptor=descriptor, target_soc=spec.target_soc)
 
 
 @pytest.mark.real_compile
-def test_aot_hit_with_jit_disabled_default_packaged_path(real_release, tmp_path):
-    with installed_release(real_release):
-        evidence = execute("hit_disabled", real_release, tmp_path)
-    assert evidence["source"] == "aot" and evidence["compiler_calls"] == 0
-
-
-@pytest.mark.real_compile
-def test_missing_allows_real_cold_jit_compile(real_release, tmp_path):
-    evidence = execute("missing_enabled", real_release, tmp_path)
-    assert evidence["source"] == "jit" and evidence["compiler_calls"] == 1
-
-
-@pytest.mark.real_compile
-@pytest.mark.parametrize("scenario", ["missing_disabled", "missing_cache_only"])
-def test_missing_forbidden_jit_reports_explicit_error(real_release, tmp_path, scenario):
-    evidence = execute(scenario, real_release, tmp_path)
-    assert evidence["category"] == "missing" and not evidence["fallback"]
-
-
-@pytest.mark.real_compile
-def test_corrupt_digest_is_fatal_even_with_jit_enabled(real_release, tmp_path):
-    root = corrupt_package_copy(real_release, tmp_path / "damaged-releases")
-    evidence = execute("corrupt", real_release, tmp_path, search_root=root)
-    assert evidence["category"] == "corrupt" and evidence["compiler_calls"] == 0
-
-
-@pytest.mark.real_compile
-def test_incompatible_soc_has_candidate_reason(real_release, tmp_path):
-    other = build_release(tmp_path / "other-soc", target="ascend910b1")
-    evidence = execute("incompatible", real_release, tmp_path, search_root=other.parent)
-    assert evidence["category"] == "missing" and evidence["compiler_calls"] == 0
-
-
-@pytest.mark.real_compile
-def test_missing_aclnn_symbol_is_load_error_without_jit(real_release, tmp_path):
-    from flashinfer.jit import DiskJitBuildStore, JitSpec
-    from flashinfer.jit.cache import verify_build_directory
-
-    record = verify_build_directory(real_release)
-    spec = JitSpec.from_dict(json.loads((real_release / "manifest.json").read_text())["spec"])
-    package = json.loads((real_release / "op-package.json").read_text())
-    store = DiskJitBuildStore(tmp_path / "symbol-fixture")
-    with store.staging(spec) as staging:
-        shutil.copytree(real_release, staging, dirs_exist_ok=True,
+@pytest.mark.requires_soc("Ascend950")
+@pytest.mark.parametrize("change", ["missing_symbol", "second_generation"])
+def test_verified_release_errors_do_not_fall_back(matmul_release, tmp_path, change):
+    env, match = matmul_release
+    store = DiskJitBuildStore(tmp_path / "store")
+    with store.staging(match.spec) as staging:
+        shutil.copytree(match.directory, staging, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("manifest.json", "build.log"))
-        library = staging / package["api_library"]
-        symbol = package["recipe"]["host_entry"].encode()
-        payload = library.read_bytes()
-        assert symbol in payload
-        library.write_bytes(payload.replace(symbol, b"x" + symbol[1:]))
-        # Publish intentional missing-symbol bytes with a valid store inventory:
-        # this is a loader ABI rejection, distinct from the corrupt-digest case.
-        replacement = store.publish(spec, staging, record.artifact)
-    directory = store.directory(replacement)
-    verify_build_directory(directory, spec=spec, record=replacement)
-    evidence = execute("load_error", real_release, tmp_path, search_root=directory)
-    assert evidence["category"] == "load error" and evidence["compiler_calls"] == 0
+        if change == "missing_symbol":
+            package = json.loads((staging / "op-package.json").read_text())
+            library = staging / package["api_library"]
+            symbol = match.recipe.host_entry.encode()
+            data = library.read_bytes()
+            assert symbol in data
+            library.write_bytes(data.replace(symbol, b"x" + symbol[1:]))
+        else:
+            with (staging / "ascendc-recipe.json").open("ab") as receipt:
+                receipt.write(b"\n")
+        other = store.publish(match.spec, staging, match.record.artifact)
+    assert other.fingerprint != match.record.fingerprint
+    changed = store.directory(other)
+    worker = dict(os.environ, **env, FLASHINFER_NPU_JIT_DISABLE="1")
+    worker.pop("ASCEND_CUSTOM_OPP_PATH", None)
+    worker["FLASHINFER_AOT_PATHS"] = str(changed if change == "missing_symbol" else match.directory)
+    subprocess.run([sys.executable, "-B", "-m", __spec__.name, change, str(changed)],
+                   cwd=Path(__file__).resolve().parents[2], env=worker, check=True, timeout=180)
 
 
-@pytest.mark.real_compile
-def test_second_package_identity_refused_without_jit(real_release, tmp_path):
-    from flashinfer.jit import DiskJitBuildStore, JitSpec
-    from flashinfer.jit.cache import verify_build_directory
+def check_release(change, changed):
+    from unittest.mock import patch
+    import torch
+    import torch_npu
+    import flashinfer
+    from flashinfer.jit import AscendCBackend, AscendCToolchain
+    from flashinfer.jit.discovery import AotLoadError
 
-    record = verify_build_directory(real_release)
-    spec = JitSpec.from_dict(json.loads((real_release / "manifest.json").read_text())["spec"])
-    store = DiskJitBuildStore(tmp_path / "second-identity")
-    with store.staging(spec) as staging:
-        shutil.copytree(real_release, staging, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("manifest.json", "build.log"))
-        # Same executable/ABI, distinct valid immutable build-record identity.
-        receipt = staging / "ascendc-recipe.json"
-        receipt.write_bytes(receipt.read_bytes() + b"\n")
-        second = store.publish(spec, staging, record.artifact)
-    assert second.fingerprint != record.fingerprint
-    evidence = execute("identity", real_release, tmp_path, search_root=real_release,
-                       second_release=store.directory(second))
-    assert evidence["category"] == "load error" and evidence["first_numerical"]
+    torch.npu.set_device(int(os.environ.get("FLASHINFER_TEST_NPU_DEVICE", "0")))
+    runner = flashinfer.get_global_registry().get(AOT_KERNEL_ID).runner
+    runner.index = AotPackageIndex((Path(os.environ["FLASHINFER_AOT_PATHS"]),))
+    x = torch.ones(16, 16, device="npu", dtype=torch.bfloat16)
+    y = x + 1
+    torch.testing.assert_close(y.cpu(), torch.full((16, 16), 2, dtype=torch.bfloat16))
+
+    def matmul():
+        return flashinfer.matmul(x, y, backend="ascendc", kernel_id=AOT_KERNEL_ID)
+
+    forbidden = AssertionError("AOT activation must not invoke a compiler")
+    with patch.object(AscendCBackend, "compile", side_effect=forbidden), \
+         patch.object(AscendCToolchain, "discover", side_effect=forbidden):
+        if change == "missing_symbol":
+            with pytest.raises(AotLoadError, match="no ACLNN symbol") as error:
+                matmul()
+        else:
+            expected = x.cpu() @ y.cpu()
+            torch.testing.assert_close(matmul().cpu(), expected, atol=0, rtol=0)
+            descriptor, _, spec = load_contract(AOT_KERNEL_ID)
+            match = AotPackageIndex((Path(changed),)).find(spec, descriptor=descriptor, target_soc=spec.target_soc)
+            with pytest.raises(AotLoadError, match="process-scoped.*fresh process") as error:
+                match.load()
+            torch.testing.assert_close(matmul().cpu(), expected, atol=0, rtol=0)
+        assert error.value.__cause__ is not None
+
+
+if __name__ == "__main__":
+    check_release(*sys.argv[1:])

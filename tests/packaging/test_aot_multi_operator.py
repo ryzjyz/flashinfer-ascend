@@ -4,7 +4,6 @@ import ctypes as C
 from dataclasses import replace
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,7 +11,7 @@ from flashinfer.jit import DiskJitBuildStore
 from flashinfer.jit.build import _verify_output
 from flashinfer.jit import op_package as package
 from flashinfer.runtime import SchemaError
-from tests.packaging.test_ascendc_op_package import generation, unit, write_fixture
+from tests.packaging.test_ascendc_op_package import fake_runtime, generation, unit, write_fixture
 
 
 def publish_other(unit, root, **changes):
@@ -30,35 +29,7 @@ def publish_other(unit, root, **changes):
     return store.directory(record)
 
 
-@pytest.fixture
-def runtime(monkeypatch, unit):
-    calls = []
-    recipe = unit[0]
-
-    def cdll(path, mode):
-        calls.append(Path(path))
-        name = "aclnnFiOtherOperator" if "flashinfer_other_operator" in str(path) else recipe.host_entry
-
-        def workspace(*args):
-            return 0
-
-        def launch(*args):
-            return 0
-
-        return SimpleNamespace(**{name: launch, name + "GetWorkspaceSize": workspace})
-
-    monkeypatch.setattr(C, "CDLL", cdll)
-    monkeypatch.setattr(package, "_active_package", None)
-    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "")
-    monkeypatch.delenv("ASCEND_CUSTOM_OPP_PATH", raising=False)
-    yield calls
-    if package._active_package is not None:
-        for _, module in package._active_package.values():
-            if module._registration_fd is not None:
-                os.close(module._registration_fd)
-
-
-def test_distinct_operators_retain_both_modules_and_verified_vendor_paths(unit, generation, runtime, tmp_path):
+def test_distinct_operators_retain_both_modules_and_verified_vendor_paths(unit, generation, fake_runtime, tmp_path):
     store, record, _ = generation
     first_path = store.directory(record)
     second_path = publish_other(unit, tmp_path / "second")
@@ -69,11 +40,11 @@ def test_distinct_operators_retain_both_modules_and_verified_vendor_paths(unit, 
     paths = [Path(path) for path in os.environ["ASCEND_CUSTOM_OPP_PATH"].split(os.pathsep)]
     assert len(paths) == 2
     assert paths[0].samefile(first.vendor_path) and paths[1].samefile(second.vendor_path)
-    assert len(runtime) == 2
+    assert len(fake_runtime) == 2
 
 
 @pytest.mark.parametrize("collision", ["vendor", "operator"])
-def test_existing_vendor_op_type_or_api_cannot_be_rebound(unit, generation, runtime, tmp_path, collision):
+def test_existing_vendor_op_type_or_api_cannot_be_rebound(unit, generation, fake_runtime, tmp_path, collision):
     store, record, _ = generation
     module = package.load_op_package(store.directory(record), target_soc=record.artifact.target_soc)
     previous = os.environ["ASCEND_CUSTOM_OPP_PATH"]
@@ -86,10 +57,10 @@ def test_existing_vendor_op_type_or_api_cannot_be_rebound(unit, generation, runt
         package.load_op_package(second, target_soc=record.artifact.target_soc)
     assert os.environ["ASCEND_CUSTOM_OPP_PATH"] == previous
     assert package.load_op_package(store.directory(record), target_soc=record.artifact.target_soc) is module
-    assert len(runtime) == 1
+    assert len(fake_runtime) == 1
 
 
-def test_late_operator_requires_a_new_activation_group(unit, generation, runtime, tmp_path):
+def test_late_operator_requires_a_new_activation_group(unit, generation, fake_runtime, tmp_path):
     store, record, _ = generation
     first = package.load_op_package(store.directory(record), target_soc=record.artifact.target_soc)
     previous = os.environ["ASCEND_CUSTOM_OPP_PATH"]
@@ -99,10 +70,10 @@ def test_late_operator_requires_a_new_activation_group(unit, generation, runtime
         package.load_op_package(second, target_soc=record.artifact.target_soc)
     assert os.environ["ASCEND_CUSTOM_OPP_PATH"] == previous
     assert package.load_op_package(store.directory(record), target_soc=record.artifact.target_soc) is first
-    assert len(runtime) == 1
+    assert len(fake_runtime) == 1
 
 
-def test_failed_group_activation_releases_all_aliases(unit, generation, runtime, tmp_path, monkeypatch):
+def test_failed_group_activation_releases_all_aliases(unit, generation, fake_runtime, tmp_path, monkeypatch):
     store, record, _ = generation
     second = publish_other(unit, tmp_path / "second")
     original = C.CDLL

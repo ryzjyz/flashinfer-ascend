@@ -65,8 +65,7 @@ def run(mode):
     stream = torch.npu.Stream()
     with torch.npu.stream(stream):
         for m, n, k in shapes:
-            # Preserve positive storage offsets, and cross the TorchNPU host
-            # queue before direct Triton launch, using the same tensors/out.
+            # Exercise nonzero storage offsets with a TorchNPU producer.
             ca = (torch.randn(m + 1, k) * .25).bfloat16()
             cb = (torch.randn(k + 1, n) * .25).bfloat16()
             a, b = ca.npu()[1:], cb.npu()[1:]

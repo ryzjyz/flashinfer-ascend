@@ -1,4 +1,4 @@
-"""T13-II host contracts. Synthetic ELF fixtures are never executed.
+"""Public op-package verification and process-scoped vendor loading.
 
 Real compiler-free NPU execution is exercised by examples/ascendc_aot_a5.py.
 """
@@ -10,6 +10,7 @@ import hashlib
 from pathlib import Path
 import platform
 import struct
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -27,9 +28,11 @@ from flashinfer.jit import op_package as package
 from flashinfer.runtime import (
     ArtifactFormat, Backend, CompileMode, KernelDescriptor, KernelLaunchABI, KernelRegistry, SchemaError,
 )
-from tests.support.legacy_ascendc import ROOT, BuildRecipe, AscendCBuildConfig, load_build_recipes, export_op_package, resolve_build_recipe
+from flashinfer.aot.build import export_op_package
+from flashinfer.jit import AscendCBuildConfig, BuildRecipe, load_build_recipes, resolve_build_recipe
 
-
+ROOT = Path(__file__).resolve().parents[2]
+TEST_TORCH_ABI = {"torch": "fixture", "torch_npu": "fixture"}
 
 
 def elf_fixture(symbols, *, machine, kind):
@@ -53,7 +56,7 @@ def elf_fixture(symbols, *, machine, kind):
 
 @pytest.fixture
 def unit():
-    config = AscendCBuildConfig(output_kind="op_package")
+    config = AscendCBuildConfig(implementation="native", target_soc="Ascend950")
     recipe = config.select(load_build_recipes(ROOT / "csrc/recipes/matmul_probe.json"), "matmul_probe")
     toolchain = AscendCToolchain(Path("/absent"), Path("/absent/bisheng"), Path("/absent/cmake"),
                                 Path("/absent/c++"), (("fixture", "synthetic"),))
@@ -61,6 +64,7 @@ def unit():
     backend = AscendCBackend(recipes=(resolved,), toolchain=toolchain)
     descriptor = KernelDescriptor(recipe.kernel_id, "test.t13.matmul_probe", Backend.ASCENDC,
         compile_mode=CompileMode.AOT, source=recipe.source, target_soc=recipe.target_soc,
+        tiling_schema_version=recipe.tiling_schema_version,
         launch_abi=KernelLaunchABI(recipe.launch_abi, recipe.host_entry,
                                   ("workspace", "workspace_bytes", "executor", "stream")))
     spec = declare_kernel(recipe.kernel_id, backend=backend,
@@ -68,6 +72,19 @@ def unit():
         output_path="op-package.json", entry_point=recipe.host_entry,
         environment_fingerprint=toolchain.fingerprint, specialization_fingerprint="a" * 64)
     return recipe, backend, spec
+
+
+def write_binding(directory, recipe):
+    # These bytes exercise the package verifier. Code generation and real ELFs have separate tests.
+    declaration = recipe.to_dict()
+    record = dict(schema_version=1, kernel_id=recipe.kernel_id,
+                  recipe_fingerprint=recipe.fingerprint, host_entry=recipe.host_entry,
+                  tensor_parameters=declaration["tensor_parameters"], attributes=declaration.get("attributes", []))
+    for suffix, field in ((".h", "header_sha256"), (".cpp", "source_sha256")):
+        content = ("// Synthetic binding for " + recipe.host_entry + suffix).encode()
+        (directory / ("fi_aclnn_adapter" + suffix)).write_bytes(content)
+        record[field] = hashlib.sha256(content).hexdigest()
+    (directory / "fi_aclnn_adapter.json").write_text(json.dumps(record))
 
 
 def write_fixture(directory, recipe, spec):
@@ -85,18 +102,25 @@ def write_fixture(directory, recipe, spec):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(value if isinstance(value, bytes) else json.dumps(value).encode())
 
-    write(paths["api"], elf_fixture((recipe.host_entry, recipe.host_entry + "GetWorkspaceSize"),
-                                   machine={"x86_64": 62, "aarch64": 183}[platform.machine()], kind=3))
+    host = {"x86_64": 62, "aarch64": 183}[platform.machine()]
+    write(paths["api"], elf_fixture((recipe.host_entry, recipe.host_entry + "GetWorkspaceSize",
+                                    "fi_aclnn_binding_fingerprint"), machine=host, kind=3))
+    write("fi_aclnn_submit.so", elf_fixture(("fi_submit", "fi_submit_identity"), machine=host, kind=3))
+    write_binding(directory, recipe)
+    support = {"opMode": "dynamic"}
+    for role in ("input", "output"):
+        support[role + "s"] = [dict(name=p.name, dtype=p.dtype) for p in recipe.tensor_parameters if p.role == role]
     binary = elf_fixture((entry,), machine=0x1029, kind=2)
     write(paths["binary"], binary)
     write(paths["metadata"], dict(binFileSuffix=".o", core_type="AIC", coreType="AiCore",
         magic="RT_DEV_BINARY_MAGIC_ELF_AICUBE", sha256=hashlib.sha256(binary).hexdigest(),
-        kernelList=[dict(kernelName=entry)]))
+        supportInfo=support, kernelList=[dict(kernelName=entry)]))
     write(paths["config"], {recipe.package_op_type: dict(binaryList=[dict(
         binPath=compute + "/probe/kernel.o", jsonPath=compute + "/probe/kernel.json")])})
     write(paths["tiling"], b"fixture auxiliary library, never loaded")
     write(paths["run"], b"fixture installer, never executed")
-    write(spec.output_path, dict(schema_version=1, output_adapter=recipe.output_adapter,
+    write(spec.output_path, dict(schema_version=2, native_adapter="fi_aclnn_adapter.json",
+        torch_abi=TEST_TORCH_ABI, output_adapter=recipe.output_adapter,
         spec_fingerprint=spec.fingerprint, recipe=recipe.to_dict(), vendor_path=vendor,
         api_library=paths["api"], compute_unit=compute, run_file=paths["run"]))
     return paths
@@ -116,30 +140,29 @@ def generation(unit, tmp_path):
 @pytest.fixture
 def fake_runtime(monkeypatch):
     calls = []
-    statuses = dict(workspace=0, launch=0)
-
-    def workspace(a, b, c, size, executor):
-        calls.append(("workspace", a, b, c))
-        C.cast(size, C.POINTER(C.c_uint64))[0] = 16
-        C.cast(executor, C.POINTER(C.c_void_p))[0] = 1234
-        return statuses["workspace"]
-
-    def launch(*args):
-        calls.append(("launch",) + args)
-        return statuses["launch"]
 
     def cdll(path, mode):
-        calls.append(("dlopen", path))
-        assert "packages/vendors/flashinfer_t13_native" in package.os.environ["ASCEND_CUSTOM_OPP_PATH"]
-        return SimpleNamespace(aclnnFiMatmulProbeNative=launch,
-                              aclnnFiMatmulProbeNativeGetWorkspaceSize=workspace)
+        library = Path(path)
+        calls.append(library)
+        vendor = library.parents[2]
+        assert any(p.is_dir() and p.samefile(vendor) for p in
+                   map(Path, os.environ["ASCEND_CUSTOM_OPP_PATH"].split(os.pathsep)))
+        manifest = library.parents[5] / "op-package.json"
+        recipe = BuildRecipe.from_dict(json.loads(manifest.read_text())["recipe"])
+        return SimpleNamespace(fi_aclnn_binding_fingerprint=lambda: recipe.fingerprint.encode(),
+                               **{recipe.host_entry: object(), recipe.host_entry + "GetWorkspaceSize": object()})
 
+    monkeypatch.setattr("flashinfer.aclnn.build.torch_abi", lambda: TEST_TORCH_ABI)
     monkeypatch.setattr(C, "CDLL", cdll)
     monkeypatch.setattr(package, "_active_package", None)
-    # Track an initially absent key before the loader mutates os.environ.
-    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "")
     monkeypatch.delenv("ASCEND_CUSTOM_OPP_PATH", raising=False)
-    return calls, statuses
+    try:
+        yield calls
+    finally:
+        for _, module in (package._active_package or {}).values():
+            if module._registration_fd is not None:
+                os.close(module._registration_fd)
+        os.environ.pop("ASCEND_CUSTOM_OPP_PATH", None)
 
 
 def test_all_output_variants_bind_their_complete_source_closure():
@@ -149,9 +172,8 @@ def test_all_output_variants_bind_their_complete_source_closure():
         if recipe.implementation == "native":
             resolve_build_recipe(recipe, source_root=ROOT, toolchain_fingerprint="a" * 64)
     for implementation in ("native", "catlass"):
-        for output in ("host_shared", "op_package"):
-            selected = AscendCBuildConfig(implementation, output).select(recipes, "matmul_probe")
-            assert (selected.implementation, selected.output_kind) == (implementation, output)
+        selected = AscendCBuildConfig(implementation, target_soc="Ascend950").select(recipes, "matmul_probe")
+        assert (selected.implementation, selected.output_kind) == (implementation, "op_package")
 
 
 @pytest.mark.parametrize("soc,compute", [
@@ -171,9 +193,9 @@ def test_requested_soc_stays_bound_even_when_compute_unit_is_a_family(unit, soc,
 
 def test_unsupported_catlass_architecture_and_unknown_soc_fail_before_discovery(monkeypatch):
     recipes = load_build_recipes(ROOT / "csrc/recipes/matmul_probe.json")
-    catlass = AscendCBuildConfig("catlass", "op_package").select(recipes, "matmul_probe")
+    catlass = AscendCBuildConfig("catlass", target_soc="Ascend950").select(recipes, "matmul_probe")
     with pytest.raises(SchemaError, match="Arch::Ascend950"):
-        _for_target(catlass, "ascend910b1")
+        _for_target(catlass, "ascend310p1")
     with pytest.raises(SchemaError, match="unsupported.*SOC"):
         _for_target(catlass, "unrecognized")
 
@@ -221,10 +243,10 @@ def test_every_release_file_is_verified_before_dlopen(generation, fake_runtime, 
     target.write_bytes(b"corrupted or injected")
     with pytest.raises(SchemaError, match="inventory mismatch"):
         package.load_op_package(release, target_soc=record.artifact.target_soc)
-    assert fake_runtime[0] == []
+    assert fake_runtime == []
 
 
-def test_export_load_and_both_aclnn_stages_need_no_compiler_or_sources(generation, fake_runtime, tmp_path, monkeypatch):
+def test_export_and_load_verified_package_once_without_compiler_or_sources(generation, fake_runtime, tmp_path, monkeypatch):
     store, record, _ = generation
     release = export_op_package(store.directory(record), tmp_path / "release")
     assert not (release / "build.log").exists()
@@ -237,18 +259,9 @@ def test_export_load_and_both_aclnn_stages_need_no_compiler_or_sources(generatio
     monkeypatch.setattr(AscendCToolchain, "discover", forbidden)
     monkeypatch.setattr(AscendCBackend, "compile", forbidden)
     module = package.load_op_package(release, target_soc=record.artifact.target_soc)
-    size, executor = module.get_workspace_size(1, 2, 3)
-    assert size == 16 and executor.value == 1234
-    module.launch(99, size, executor, 7)
     assert package.load_op_package(release, target_soc=record.artifact.target_soc) is module
-    calls, statuses = fake_runtime
-    assert len([c for c in calls if c[0] == "dlopen"]) == 1
-    statuses["workspace"] = 161001
-    with pytest.raises(RuntimeError, match="GetWorkspaceSize returned 161001"):
-        module.get_workspace_size(1, 2, 3)
-    statuses["launch"] = 7
-    with pytest.raises(RuntimeError, match="aclnnFiMatmulProbeNative returned 7"):
-        module.launch(99, size, executor, 7)
+    assert module.call_path == release / "fi_aclnn_submit.so"
+    assert len(fake_runtime) == 1
     with pytest.raises(SchemaError, match="requested SOC"):
         package.load_op_package(release, target_soc="ascend910b1")
 
@@ -283,4 +296,4 @@ def test_different_package_cannot_silently_replace_process_registration(unit, ge
         other = other_store.publish(other_spec, staging, _verify_output(other_spec, staging))
     with pytest.raises(SchemaError, match="fresh process"):
         package.load_op_package(other_store.directory(other), target_soc=record.artifact.target_soc)
-    assert len([c for c in fake_runtime[0] if c[0] == "dlopen"]) == 1
+    assert len(fake_runtime) == 1

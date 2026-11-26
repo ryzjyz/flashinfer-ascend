@@ -1,39 +1,27 @@
-"""Versioned recipe and generic ACLNN contracts, without an SDK or device.
+"""Current ACLNN recipe, kernel metadata and native binding contracts."""
 
-Synthetic callables test argument forwarding only. Actual mixed-core execution
-and package verification belong to the separately marked real_compile tests.
-"""
-
-import ctypes as C
-from dataclasses import fields, replace
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from flashinfer.jit.core import JitSpec, _canonical_hash
-from flashinfer.jit.op_package import OP_PACKAGE_ADAPTER_HASH, OpPackageModule, verify_op_package
+from flashinfer.jit import load_build_recipes
+from flashinfer.jit.core import JitSpec
+from flashinfer.jit.op_package import OP_PACKAGE_ADAPTER_HASH, verify_op_package
 from flashinfer.jit.recipe import BuildRecipe, ShapeConstraint, TensorParameter
 from flashinfer.jit.aclnn_contract import AttributeParameter
 from flashinfer.runtime import SchemaError
 
-from tests.packaging.test_ascendc_op_package import elf_fixture, write_fixture
-from tests.support.legacy_ascendc import ROOT, BuildRecipe as LegacyBuildRecipe, load_build_recipes
-
-
+from tests.packaging.test_ascendc_op_package import elf_fixture, write_binding, write_fixture
 
 
 @pytest.fixture
-def v1():
-    return next(r for r in load_build_recipes(ROOT / "csrc/recipes/matmul_probe.json")
-                if r.output_kind == "op_package" and r.implementation == "native")
-
-
-@pytest.fixture
-def v2(v1):
-    fixture = replace(v1, schema_version=2, tiling_mode="host_dynamic", tiling_schema_version=2,
+def v2():
+    root = Path(__file__).resolve().parents[2]
+    probe = load_build_recipes(root / "csrc/recipes/matmul_probe.json")[0]
+    return replace(probe,
         tiling_host_entry="FixtureTiling", workspace_host_entry="FixtureTiling",
         workspace_bytes="dynamic", task_type="aic_aiv", sync_policy="cross_core_flags",
         tensor_parameters=(TensorParameter("a", "input", "bfloat16", ("M", "K")),
@@ -42,33 +30,10 @@ def v2(v1):
                            TensorParameter("out", "output", "bfloat16", ("M", "N"))),
         shape_constraints=tuple(ShapeConstraint(n, 16, 256, 16) for n in ("M", "N", "K")))
 
-    return BuildRecipe(**{field.name: getattr(fixture, field.name) for field in fields(fixture)})
-
 
 def metadata(m=16, n=32, k=64):
     return dict(shapes=dict(a=(m, k), b=(k, n), bias=(n,), out=(m, n)),
                 dtypes={n: "bfloat16" for n in ("a", "b", "bias", "out")})
-
-
-def test_v1_serialization_and_fingerprints_remain_exactly_frozen():
-    manifest = json.loads((ROOT / "csrc/recipes/matmul_probe.json").read_text())
-    for original in manifest:
-        recipe = LegacyBuildRecipe.from_dict(original)
-        assert json.loads(json.dumps(recipe.to_dict())) == original
-        assert recipe.fingerprint == _canonical_hash(original)
-        assert recipe.tensor_parameter_names == ("a", "b", "c")
-
-
-@pytest.mark.parametrize("change", [
-    dict(tiling_mode="host_dynamic"), dict(tiling_schema_version=2), dict(workspace_bytes=4),
-    dict(workspace_bytes="dynamic"), dict(task_type="aic_aiv"),
-    dict(sync_policy="cross_core_flags"), dict(tiling_host_entry="Tiling"),
-    dict(tensor_parameters=(TensorParameter("x", "input", "float32", (16,)),)),
-    dict(dtype_signatures=(("float16",),)),
-])
-def test_v1_does_not_inherit_v2_capabilities(v1, change):
-    with pytest.raises(SchemaError, match="v1"):
-        replace(v1, **change)
 
 
 @pytest.mark.parametrize("change,message", [
@@ -121,9 +86,8 @@ def test_shape_bounds_must_describe_a_nonempty_positive_integer_range(bounds):
         ShapeConstraint("M", *bounds)
 
 
-def test_v2_contract_is_round_trippable_and_identity_binds_every_new_field(v1, v2):
+def test_v2_contract_is_round_trippable_and_identity_binds_every_new_field(v2):
     assert BuildRecipe.from_dict(json.loads(json.dumps(v2.to_dict()))) == v2
-    assert v1.fingerprint != v2.fingerprint
     assert v2.to_dict()["schema_version"] == 2
     assert v2.device_parameter_order == ("a", "b", "bias", "out", "workspace", "tiling")
     for change in (dict(tiling_schema_version=3), dict(tiling_host_entry="OtherTiling"),
@@ -197,43 +161,6 @@ def test_dtype_signatures_express_exact_mixed_combinations_without_cartesian_exp
 def test_dtype_signatures_reject_malformed_or_ambiguous_combinations(v2, signatures):
     with pytest.raises(SchemaError, match="dtype_signatures"):
         replace(v2, dtype_signatures=signatures)
-
-
-@pytest.mark.parametrize("input_count", [0, 1, 3, 5])
-def test_generic_aclnn_adapter_forwards_recipe_order_for_arbitrary_tensor_counts(v2, input_count):
-    parameters = tuple(TensorParameter("arg%d" % i, "input", "float32", (16,))
-                       for i in range(input_count)) + (TensorParameter("result", "output", "float32", (16,)),)
-    recipe = replace(v2, tensor_parameters=parameters, shape_constraints=())
-    calls = []
-
-    def workspace(*arguments):
-        calls.append(arguments[:-2])
-        C.cast(arguments[-2], C.POINTER(C.c_uint64))[0] = 4096
-        C.cast(arguments[-1], C.POINTER(C.c_void_p))[0] = 1234
-        return 0
-
-    def launch(*arguments):
-        calls.append(arguments)
-        return 0
-
-    api = SimpleNamespace(**{recipe.host_entry + "GetWorkspaceSize": workspace, recipe.host_entry: launch})
-    module = OpPackageModule(recipe, Path("/unloaded-synthetic-package"), api)
-    arguments = tuple(range(1, len(parameters) + 1))
-    size, executor = module.get_workspace_size(*arguments)
-    assert (size, executor.value) == (4096, 1234)
-    assert calls[-1] == arguments
-    # Keyword insertion order is intentionally the reverse of the ABI order.
-    module.get_workspace_size(**dict(reversed(tuple(zip(recipe.tensor_parameter_names, arguments)))))
-    assert calls[-1] == arguments
-    module.launch(99, size, executor, 7)
-    assert calls[-1] == (99, 4096, executor, 7)
-    for incorrect in (arguments[:-1], arguments + (999,)):
-        with pytest.raises(SchemaError, match="tensor arguments"):
-            module.get_workspace_size(*incorrect)
-    with pytest.raises(SchemaError, match="match recipe order"):
-        module.get_workspace_size(wrong=1)
-    with pytest.raises(SchemaError, match="match recipe order"):
-        module.get_workspace_size(1, **dict(zip(recipe.tensor_parameter_names, arguments)))
 
 
 @pytest.fixture
@@ -322,6 +249,7 @@ def string_attribute_package(mixed_package):
         for key, value in spec.input_fingerprints))
     manifest_path = directory / spec.output_path
     manifest = json.loads(manifest_path.read_text())
+    write_binding(directory, recipe)
     manifest.update(recipe=recipe.to_dict(), spec_fingerprint=spec.fingerprint)
     manifest_path.write_text(json.dumps(manifest))
     for key in ("inputs", "outputs"):
@@ -351,25 +279,6 @@ def test_string_attributes_keep_exact_type_name_and_order_checks(string_attribut
         verify_op_package(directory, spec)
 
 
-def test_ctypes_workspace_call_encodes_string_attributes_as_utf8(v2):
-    recipe = replace(v2, attributes=(AttributeParameter("layout", "string", "BSND"),))
-    calls = []
-    def workspace(*args):
-        calls.append(args[:-2])
-        C.cast(args[-2], C.POINTER(C.c_uint64))[0] = 0
-        C.cast(args[-1], C.POINTER(C.c_void_p))[0] = 1234
-        return 0
-    api = SimpleNamespace(**{recipe.host_entry + "GetWorkspaceSize": workspace})
-    module = OpPackageModule(recipe, Path("/unloaded-string-package"), api)
-    size, executor = module.get_workspace_size(1, 2, 3, 4)
-    assert (size, executor.value) == (0, 1234)
-    assert calls[-1] == (1, 2, 3, b"BSND", 4)
-    module.get_workspace_size(1, 2, 3, 4, layout="序列")
-    assert calls[-1] == (1, 2, 3, "序列".encode("utf-8"), 4)
-    with pytest.raises(SchemaError, match="without NUL"):
-        module.get_workspace_size(1, 2, 3, 4, layout="BSND\0TND")
-
-
 def test_absent_optional_tensor_resolves_only_a_coherent_declared_dtype(v2):
     recipe = replace(v2,
         tensor_parameters=tuple(replace(p, optional=True) if p.name == "bias" else p
@@ -397,6 +306,7 @@ def dual_dtype_package(mixed_package):
         for key, value in spec.input_fingerprints))
     manifest_path = directory / spec.output_path
     manifest = json.loads(manifest_path.read_text())
+    write_binding(directory, recipe)
     manifest.update(recipe=recipe.to_dict(), spec_fingerprint=spec.fingerprint)
     manifest_path.write_text(json.dumps(manifest))
     other_metadata = json.loads(json.dumps(metadata))

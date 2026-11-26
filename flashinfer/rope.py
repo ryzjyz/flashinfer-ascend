@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Optional, Union
 
-from .runtime import Backend, build_signature, current_hardware, dispatch
-from .runtime.runner import run_selected as _run_selected
+from .runtime import Backend, current_hardware
+from .runtime.runner import run_operator
 
 _OP_APPLY_ROPE = "rope.apply_rope_with_cos_sin_cache_inplace"
 _OP_APPLY_ROPE_OUT = "rope.apply_rope_with_cos_sin_cache"
@@ -64,24 +64,12 @@ def apply_rope_with_cos_sin_cache_inplace(
     if dtype_name != "float32":
         raise ValueError("cos_sin_cache should be float32")
 
-    signature = build_signature(
-        _OP_APPLY_ROPE,
-        (positions, query, key, cos_sin_cache),
-        specializations={"head_size": int(head_size), "is_neox": bool(is_neox)},
-    )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-
-
-    _run_selected(
-        decision.kernel_id,
-        positions,
-        query,
-        key,
-        int(head_size),
-        cos_sin_cache,
-        bool(is_neox),
+    run_operator(
+        _OP_APPLY_ROPE, (positions, query, key, cos_sin_cache),
+        (positions, query, key, int(head_size), cos_sin_cache, bool(is_neox)),
+        specializations={"head_size": int(head_size), "is_neox": bool(is_neox)}, backend=backend,
+        kernel_id=kernel_id,
+        hardware=current_hardware(),
     )
 
 
@@ -105,10 +93,10 @@ def _pos_ids_from_indptr(indptr, offsets):
 
 
 def _dispatch_rope(op, tensors, specializations, args, backend, kernel_id):
-    signature = build_signature(op, tensors, specializations=specializations)
-    decision = dispatch(signature, current_hardware(), backend=backend, kernel_id=kernel_id)
-
-    return _run_selected(decision.kernel_id, *args)
+    return run_operator(
+        op, tensors, args, specializations=specializations, backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
+    )
 
 
 def apply_rope_pos_ids_inplace(

@@ -213,9 +213,14 @@ def _relative_file(directory: Path, locator: str) -> Path:
     return resolved
 
 
-def _triton_files(directory: Path, artifact: ArtifactRef, spec_fingerprint: str):
+def _triton_files(directory: Path, artifact: ArtifactRef, spec):
+    from ._triton_abi import spec_task_queue
+
     data = json.loads((directory / "triton.json").read_text())
-    if (data["schema_version"] != 1 or data["spec_fingerprint"] != spec_fingerprint
+    if data.get("task_queue") is not spec_task_queue(spec):
+        raise SchemaError("Triton launcher policy differs from its spec; rebuild the artifact")
+    if (data["schema_version"] != 1 or data["spec_fingerprint"] != spec.fingerprint
+            or artifact.build_id != spec.fingerprint
             or data["entry_point"] != artifact.entry_point):
         raise SchemaError("Triton load metadata does not bind the compilation unit")
     group = {name: str(_relative_file(directory, path))
@@ -247,10 +252,22 @@ class _TritonExecutable:
     """Keep Triton's CompiledKernel/extensions alive and supply its stream ABI."""
 
     def __init__(self, kernel, extensions, data, device):
+        import torch_npu
+
         self.kernel = kernel
         self.extensions = extensions
         self.data = data
         self.device = device
+        constants = data["constexprs"]
+        names = data["arg_names"]
+        self._runtime_names = tuple(name for name in names if name not in constants)
+        self._constant_tail = None
+        if tuple(names[:len(self._runtime_names)]) == self._runtime_names:
+            self._constant_tail = tuple(constants[name] for name in names[len(self._runtime_names):])
+        # Match Triton Ascend's stream selection without discovering a compiler
+        # or initializing its global driver on a prebuilt-only disk hit.
+        api = torch_npu._C
+        self._queued_stream = getattr(api, "_npu_getCurrentRawStreamNoWait", api._npu_getCurrentRawStream)
 
     def __getitem__(self, grid):
         grid = tuple(grid)
@@ -263,15 +280,23 @@ class _TritonExecutable:
 
             if torch.npu.current_device() != self.device:
                 raise RuntimeError("Triton module must launch on its loaded NPU device")
-            constants = self.data["constexprs"]
-            runtime_names = [name for name in self.data["arg_names"] if name not in constants]
-            if len(args) != len(runtime_names):
-                raise TypeError("Triton entry expects runtime arguments %s" % runtime_names)
-            values = dict(zip(runtime_names, args))
-            values.update(constants)
-            if stream is None:
-                stream = torch.npu.current_stream(self.device).npu_stream
-            return self.kernel[grid](*(values[name] for name in self.data["arg_names"]), stream=stream)
+            if len(args) != len(self._runtime_names):
+                raise TypeError(f"Triton entry expects runtime arguments {self._runtime_names}")
+            if self._constant_tail is not None:
+                packed = args + self._constant_tail
+            else:
+                values = dict(zip(self._runtime_names, args))
+                values.update(self.data["constexprs"])
+                packed = tuple(values[name] for name in self.data["arg_names"])
+            if self.data["task_queue"]:
+                if stream is None:
+                    stream = self._queued_stream(self.device)
+            else:
+                from ._triton_abi import direct_launch_stream
+                current = direct_launch_stream(torch.npu.current_stream(self.device))
+                if stream is None:
+                    stream = current
+            return self.kernel[grid](*packed, stream=stream)
 
         return launch
 
@@ -306,7 +331,9 @@ class DefaultJitModuleLoader:
         from triton.compiler.compiler import CompiledKernel
         from triton.backends.ascend.driver import wrap_handle_tensordesc
 
-        data, group = _triton_files(directory, record.artifact, record.spec_fingerprint)
+        from .core import JitSpec
+        spec = JitSpec.from_dict(json.loads((directory / "manifest.json").read_text())["spec"])
+        data, group = _triton_files(directory, record.artifact, spec)
         versions = {"triton": triton.__version__, "torch": torch.__version__,
                     "torch_npu": torch_npu.__version__, "python_abi": sys.implementation.cache_tag}
         if data["versions"] != versions or not triton.__version__.startswith("3.6."):

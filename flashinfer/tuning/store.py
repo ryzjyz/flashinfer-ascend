@@ -40,9 +40,19 @@ def _digest(value):
 def _db_path():
     value = os.environ.get("FLASHINFER_NPU_TUNING_DB")
     if value is None:
-        value = str(Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
-                    / "flashinfer" / "tuning.sqlite3")
+        value = _default_db_path(os.environ.get("XDG_CACHE_HOME", "~/.cache"),
+                                 os.environ.get("HOME"))
+        # A relative cache root follows chdir. Most installations use an
+        # absolute root that was already normalized on the cache miss.
+        return value if os.path.isabs(value) else os.path.abspath(value)
     return os.path.abspath(os.path.expanduser(value)) if value else ""
+
+
+@lru_cache(maxsize=8)
+def _default_db_path(cache_home, home):
+    # HOME participates in tilde expansion. Relative paths still resolve against
+    # the current working directory in _db_path on every lookup.
+    return os.path.normpath(Path(cache_home).expanduser() / "flashinfer" / "tuning.sqlite3")
 
 
 def tuning_cache_token():

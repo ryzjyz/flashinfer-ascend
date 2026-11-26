@@ -1,15 +1,17 @@
 """配置项（设计文档 §13）：全部经环境变量读取。
 
-不做进程内缓存——每次调用直读 ``os.environ``，测试可通过
+每次调用直读 ``os.environ``，相同的调度顺序复用解析结果。测试可通过
 ``monkeypatch.setenv`` 即时改变行为。
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
 import os
 
 _DEFAULT_CACHE_ROOT = os.path.join("~", ".cache", "flashinfer")
 _DEFAULT_DISPATCH_ORDER = ("external", "cann", "aot", "jit", "reference")
+_DISPATCH_ORDER_ENV = "FLASHINFER_NPU_DISPATCH_ORDER"
 
 
 def cache_dir() -> str:
@@ -47,10 +49,14 @@ def dispatch_order() -> tuple[str, ...]:
     cann 包含 ACLNN；aot/jit 包含自研及已 opt-in 的 custom，未声明
     AOT 的自研归 jit。非法值抛 ValueError，不缓存环境变量。
     """
-    name = "FLASHINFER_NPU_DISPATCH_ORDER"
-    raw = os.environ.get(name)
+    raw = os.environ.get(_DISPATCH_ORDER_ENV)
     if raw is None:
         return _DEFAULT_DISPATCH_ORDER
+    return _parse_dispatch_order(raw)
+
+
+@lru_cache(maxsize=16)
+def _parse_dispatch_order(raw: str) -> tuple[str, ...]:
     order = tuple(item.strip() for item in raw.split(","))
     unknown = sorted(set(order) - set(_DEFAULT_DISPATCH_ORDER))
     missing = sorted(set(_DEFAULT_DISPATCH_ORDER) - set(order))
@@ -64,7 +70,7 @@ def dispatch_order() -> tuple[str, ...]:
         if duplicates:
             details.append(f"重复档位 {duplicates!r}")
         raise ValueError(
-            f"{name}={raw!r} 无效：{'；'.join(details)}。"
+            f"{_DISPATCH_ORDER_ENV}={raw!r} 无效：{'；'.join(details)}。"
             "须将 external,cann,aot,jit,reference 按优先顺序完整排列，"
             "逗号分隔且每档恰好一次。"
         )

@@ -319,7 +319,7 @@ def test_later_source_failure_prevents_all_compilation(
     monkeypatch.setattr(build, "resolve_build_recipe", resolve)
     monkeypatch.setattr(build, "AscendCBackend", lambda **kwargs: object())
     monkeypatch.setattr(
-        build, "_publish", lambda *a: pytest.fail("partial batch compiled")
+        build, "_build_package", lambda *a: pytest.fail("partial batch compiled")
     )
     with pytest.raises(SchemaError, match="later source failed"):
         build.build_production_packages(output_dir=tmp_path / "release")
@@ -369,6 +369,8 @@ def test_generic_cli_accepts_batch_selectors_and_dependency_roots(
             "example/two",
             "--dependency-root",
             "support=" + str(tmp_path),
+            "--jobs",
+            "2",
             "--output-dir",
             str(tmp_path / "release"),
         ],
@@ -379,6 +381,7 @@ def test_generic_cli_accepts_batch_selectors_and_dependency_roots(
     build.main()
     assert calls[0]["kernel_ids"] == ["example/one", "example/two"]
     assert calls[0]["dependency_roots"] == {"support": tmp_path}
+    assert calls[0]["jobs"] == 2
 
 
 @pytest.mark.parametrize(
@@ -387,6 +390,7 @@ def test_generic_cli_accepts_batch_selectors_and_dependency_roots(
         ["--all"],
         ["--freeze"],
         ["--freeze", "--config", "config.json"],
+        ["--all", "--output-dir", "out", "--jobs", "0"],
         ["--all", "--output-dir", "out", "--dependency-root", "invalid"],
         ["--all", "--output-dir", "out", "--dependency-root", "=path"],
         ["--all", "--output-dir", "out", "--dependency-root", "bad/name=path"],

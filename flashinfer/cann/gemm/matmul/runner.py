@@ -10,6 +10,5 @@ def _matmul_cann(a, b, out):
     validate_tensors(a, b, out)
     with torch.npu.device(a.device):
         torch.mm(a, b, out=out)
-        torch.npu.current_stream(a.device).synchronize()
 
 run = _matmul_cann

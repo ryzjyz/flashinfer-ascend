@@ -47,6 +47,8 @@ def test_typed_adapter_binds_exact_operator_and_cann_header(binding, tmp_path):
     assert record["header_sha256"] == hashlib.sha256(header.read_bytes()).hexdigest()
     assert record["source_sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert output.with_suffix(".h").read_bytes() == header.read_bytes()
+    call = output.with_name("fi_aclnn_submit.cpp").read_text()
+    assert "EXEC_NPU_CMD(aclnnFiMatmul, p0, p1, a0, p2)" in call
     before = output.read_bytes()
     generator.generate(path, tmp_path, output)
     assert output.read_bytes() == before
@@ -111,7 +113,49 @@ def test_packaged_adapter_roundtrips_native_shapes_and_rejects_another_recipe(bi
     recipe = BuildRecipe.from_dict(raw)
     generator.generate(path, tmp_path, tmp_path / "fi_aclnn_adapter.cpp")
     data = dict(native_adapter="fi_aclnn_adapter.json")
-    symbols = {"fi_aclnn_binding_fingerprint", "fi_aclnn_workspace", "fi_aclnn_launch"}
+    symbols = {"fi_aclnn_binding_fingerprint"}
     _verify_native_adapter(tmp_path, data, recipe, symbols)
     with pytest.raises(SchemaError, match="does not match"):
         _verify_native_adapter(tmp_path, data, replace(recipe, kernel_id=recipe.kernel_id + "_other"), symbols)
+
+
+def test_dynamic_slots_preserve_cann_members_and_declared_dtype_combinations(binding):
+    from dataclasses import replace
+    from flashinfer.jit.op_package import _binary_tensor_signatures
+    from flashinfer.jit.recipe import BuildRecipe, ShapeConstraint, TensorParameter
+    from flashinfer.runtime import SchemaError
+
+    recipe = replace(BuildRecipe.from_dict(binding[0]), attributes=(),
+                     tensor_parameters=(TensorParameter("xs", "input", "float32", ("N",), tensor_list=True),
+                                        TensorParameter("out", "output", "float32", ("M",))),
+                     shape_constraints=(ShapeConstraint("N", 1, 8), ShapeConstraint("M", 1, 16)),
+                     dtype_signatures=(("float32", "float32"), ("float16", "float32")))
+    dtype = {"xs": ("float32", "float16"), "out": "float32"}
+    assert recipe.validate_tensor_metadata(shapes={"xs": ((2,), (3,)), "out": (5,)}, dtypes=dtype) == {
+        "N": (2, 3), "M": 5}
+    with pytest.raises(SchemaError, match="outside declared range"):
+        recipe.validate_tensor_metadata(shapes={"xs": ((2,), (9,)), "out": (11,)}, dtypes=dtype)
+    with pytest.raises(SchemaError, match="not a declared combination"):
+        recipe.validate_tensor_metadata(shapes={"xs": ((2,), (3,)), "out": (5,)},
+                                        dtypes={"xs": ("int8", "float16"), "out": "float32"})
+    members = [dict(name="xs", paramType="dynamic", format="ND", dtype=t) for t in dtype["xs"]]
+    output = dict(name="out", paramType="required", format="ND", dtype="float32")
+    info = dict(inputs=[members], outputs=[output])
+    assert set(_binary_tensor_signatures(recipe, info)) == set(recipe.native_dtype_signatures)
+    members[1]["paramType"] = "required"
+    with pytest.raises(SchemaError, match="format/optionality"):
+        _binary_tensor_signatures(recipe, info)
+
+
+@pytest.mark.parametrize("kind,value,invalid", [
+    ("int8", -128, -129), ("uint16", 65535, 65536), ("uint64", (1 << 64) - 1, -1),
+    ("float32", 0.25, 1e39), ("bool_array", [False, True], [0, 1]),
+    ("float_array", (1, 2.5), ("1",)), ("int_array", [-2, 0], [False]), ("dtype", "int4", "unknown"),
+])
+def test_attribute_schema_roundtrip_and_native_range(kind, value, invalid):
+    from flashinfer.jit.aclnn_contract import AttributeParameter
+    from flashinfer.runtime import SchemaError
+    param = AttributeParameter("v", kind, value)
+    assert AttributeParameter(**json.loads(json.dumps(param.to_dict()))) == param
+    with pytest.raises(SchemaError):
+        param.validate(invalid)

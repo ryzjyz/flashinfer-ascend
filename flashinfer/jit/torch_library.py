@@ -49,7 +49,7 @@ def matmul_probe_op(recipe, module, *, spec=None):
     """Prepare the v2 FP32 probe through the common verified Tensor adapter.
 
     Public declarations accept only the explicit three-Tensor ACLNN contract.
-    Raw host launch and v1 decoding remain internal compatibility facilities.
+    Execution uses the typed ACLNN submission library verified with the package.
     """
     from flashinfer._meta.ascendc import matmul_probe_meta
     from flashinfer.runtime import SchemaError

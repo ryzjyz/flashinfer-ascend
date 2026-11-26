@@ -21,13 +21,8 @@ from __future__ import annotations
 
 from typing import List, Optional, Union
 
-from .runtime import (
-    Backend,
-    build_signature,
-    current_hardware,
-    dispatch,
-)
-from .runtime.runner import run_selected as _run_selected
+from .runtime import Backend, current_hardware
+from .runtime.runner import run_operator
 
 _OP_CUTLASS_FUSED_MOE = "fused_moe.cutlass_fused_moe"
 _OP_TRTLLM_FP8_PER_TENSOR_MOE = "fused_moe.trtllm_fp8_per_tensor_scale_moe"
@@ -192,32 +187,18 @@ def fused_moe(
         output = torch.empty(
             num_rows, hidden_size, dtype=output_dtype, device=input.device
         )
-    signature = build_signature(
+    run_operator(
         _OP_CUTLASS_FUSED_MOE,
         (
-            input,
-            token_selected_experts,
-            token_final_scales,
-            fc1_expert_weights,
+            input, token_selected_experts, token_final_scales, fc1_expert_weights,
             fc2_expert_weights,
         ),
+        (
+            input, token_selected_experts, token_final_scales, fc1_expert_weights,
+            fc2_expert_weights, output_dtype, output, ep_size, ep_rank, moe_context,
+        ),
         specializations={"output_dtype": _dtype_name(output_dtype), "ep_size": ep_size},
-    )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(
-        decision.kernel_id,
-        input,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc2_expert_weights,
-        output_dtype,
-        output,
-        ep_size,
-        ep_rank,
-        moe_context,
+        backend=backend, kernel_id=kernel_id, hardware=current_hardware(),
     )
     return output
 
@@ -257,40 +238,19 @@ def fp8_per_tensor_scale_moe(
     可执行（反量化 fp32 计算）。``tile_tokens_dim`` 为 SM100 调度参数，
     接受并忽略。
     """
-    signature = build_signature(
+    run_operator(
         _OP_TRTLLM_FP8_PER_TENSOR_MOE,
         (routing_logits, hidden_states, gemm1_weights, gemm2_weights),
-        specializations={
-            "top_k": int(top_k),
-            "routing_method_type": int(routing_method_type),
-        },
-    )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(
-        decision.kernel_id,
-        routing_logits,
-        routing_bias,
-        hidden_states,
-        gemm1_weights,
-        output1_scales_scalar,
-        output1_scales_gate_scalar,
-        gemm2_weights,
-        output2_scales_scalar,
-        output,
-        int(num_experts),
-        int(top_k),
-        int(n_group),
-        int(topk_group),
-        int(intermediate_size),
-        int(local_expert_offset),
-        int(local_num_experts),
-        float(routed_scaling_factor),
-        bool(use_routing_scales_on_input),
-        int(tile_tokens_dim),
-        int(routing_method_type),
-        bool(store_workspace_info),
+        (
+            routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
+            output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, output,
+            int(num_experts), int(top_k), int(n_group), int(topk_group), int(intermediate_size),
+            int(local_expert_offset), int(local_num_experts), float(routed_scaling_factor),
+            bool(use_routing_scales_on_input), int(tile_tokens_dim), int(routing_method_type),
+            bool(store_workspace_info),
+        ),
+        specializations={'top_k': int(top_k), 'routing_method_type': int(routing_method_type)},
+        backend=backend, kernel_id=kernel_id, hardware=current_hardware(),
     )
     return None
 
@@ -326,38 +286,17 @@ def fp8_block_scale_moe(
     携带 scale（``hidden_states_scale`` 布局 (hidden//128, seq_len)）。
     结果原地写入 ``output``，返回 None。910B 仅 reference kernel 可执行。
     """
-    signature = build_signature(
-        _OP_TRTLLM_FP8_BLOCK_MOE,
-        (expert_logits, hidden_states, gemm1_weights, gemm2_weights),
-        specializations={
-            "top_k": int(top_k),
-            "routing_method_type": int(routing_method_type),
-        },
-    )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(
-        decision.kernel_id,
-        expert_logits,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_scales,
-        gemm2_weights,
-        gemm2_scales,
-        output,
-        int(num_experts),
-        int(top_k),
-        int(n_groups),
-        int(top_k_groups),
-        int(intermediate_size),
-        int(local_expert_offset),
-        int(local_num_experts),
-        float(routed_scaling),
-        int(tile_tokens_dim),
-        int(routing_method_type),
+    run_operator(
+        _OP_TRTLLM_FP8_BLOCK_MOE, (expert_logits, hidden_states, gemm1_weights, gemm2_weights),
+        (
+            expert_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_scales, gemm2_weights, gemm2_scales, output, int(num_experts), int(top_k),
+            int(n_groups), int(top_k_groups), int(intermediate_size), int(local_expert_offset),
+            int(local_num_experts), float(routed_scaling), int(tile_tokens_dim),
+            int(routing_method_type),
+        ),
+        specializations={'top_k': int(top_k), 'routing_method_type': int(routing_method_type)},
+        backend=backend, kernel_id=kernel_id, hardware=current_hardware(),
     )
     return None
 

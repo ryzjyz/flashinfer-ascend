@@ -130,13 +130,22 @@ class TritonBackend(_SourceBackend):
     """
 
     backend_id = "triton"
-    generator_version = "3"
+    generator_version = "4"
     descriptor_backends = (Backend.TRITON, Backend.CUSTOM, Backend.EXTERNAL)
 
     def __init__(self, *, source_root: Optional[Path] = None,
                  python_executable: Optional[str] = None) -> None:
         self.source_root = Path(source_root) if source_root is not None else Path(__file__).parent.parent
         self.python_executable = python_executable or sys.executable
+
+    def declare(self, descriptor, *, task_queue=None, **kwargs):
+        from ._triton_abi import launcher_input, task_queue_enabled
+
+        spec = super().declare(descriptor, **kwargs)
+        policy = launcher_input(task_queue_enabled() if task_queue is None else task_queue)
+        identity = {"base": spec.name, "launcher": policy[1]}
+        return replace(spec, name="kernel." + _canonical_hash(identity),
+                       input_fingerprints=spec.input_fingerprints + (policy,))
 
     def compile(self, spec: JitSpec, *, build_directory: Path) -> None:
         directory = Path(build_directory).resolve()
@@ -157,7 +166,7 @@ class TritonBackend(_SourceBackend):
                     raise ValueError("%s must be a JSON object" % key)
             if not config.get("signature"):
                 raise ValueError("Triton compilation requires an explicit signature=<JSON>")
-            from ._triton_abi import triton_binary_mode
+            from ._triton_abi import spec_task_queue, triton_binary_mode
             triton_binary_mode(config)
             root = self.source_root.resolve()
             source_path = (root / spec.source.locator).resolve()
@@ -172,6 +181,7 @@ class TritonBackend(_SourceBackend):
                 "spec": spec.to_dict(), "config": config,
             }), encoding="utf-8")
             env = os.environ.copy()
+            env["TRITON_ENABLE_TASKQUEUE"] = "1" if spec_task_queue(spec) else "0"
             env["PYTHONPATH"] = os.pathsep.join(filter(None, (
                 str(Path(__file__).resolve().parents[2]), env.get("PYTHONPATH"))))
             env["TRITON_CACHE_DIR"] = str(directory / "triton-cache")

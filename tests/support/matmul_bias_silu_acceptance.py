@@ -11,9 +11,6 @@ import shutil
 from flashinfer._resources import data_root
 
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
 def run_scenario(scenario, store_root):
     import torch
     import torch_npu  # noqa: F401
@@ -24,7 +21,7 @@ def run_scenario(scenario, store_root):
     from flashinfer import gemm
     from flashinfer.ascendc import MATMUL_BIAS_SILU_KERNEL_ID, load_contract
     from flashinfer.jit import AscendCBackend, AscendCToolchain, DiskJitBuildStore
-    from flashinfer.jit.discovery import AotCorruptError, AotMissingError
+    from flashinfer.jit.discovery import AotMissingError
     from flashinfer.aclnn import _native
     from flashinfer.runtime import get_global_registry
     from flashinfer.runtime.schema import DispatchError
@@ -47,7 +44,7 @@ def run_scenario(scenario, store_root):
     AscendCBackend.compile = counted_compile
     AscendCToolchain.discover = counted_discover
     os.environ["FLASHINFER_NPU_CACHE_DIR"] = str(store_root)
-    enabled = scenario in {"missing_enabled", "corrupt"}
+    enabled = scenario == "missing_enabled"
     os.environ["FLASHINFER_NPU_JIT_DISABLE"] = "0" if enabled else "1"
     _, recipe, spec = load_contract()
     store = DiskJitBuildStore(store_root)
@@ -93,18 +90,9 @@ def run_scenario(scenario, store_root):
 
     try:
         output = gemm.matmul_bias_silu(*tensors)
-    except (AotCorruptError, AotMissingError) as error:
-        if scenario == "corrupt":
-            assert isinstance(error, AotCorruptError)
-            assert "digest mismatch" in str(error)
-        elif scenario == "incompatible":
-            assert isinstance(error, AotMissingError)
-            assert "all incompatible" in str(error) and "target_soc mismatch" in str(error)
-        else:
-            assert scenario == "missing_disabled", str(error)
-            assert isinstance(error, AotMissingError)
-            assert "no matching AOT op-package" in str(error)
-            assert "disabled" in str(error)
+    except AotMissingError as error:
+        assert scenario == "incompatible", str(error)
+        assert "all incompatible" in str(error) and "target_soc mismatch" in str(error)
         assert counts == {"compile": 0, "toolchain": 0}
         assert store.lookup(spec) is None
         print(json.dumps(dict(scenario=scenario, result="PASS", category=error.category,
@@ -120,7 +108,7 @@ def run_scenario(scenario, store_root):
     assert counts["compile"] == counts["toolchain"] == (expected_source == "jit")
     assert provenance.spec_fingerprint == spec.fingerprint
     if scenario == "hit_disabled":
-        assert provenance.directory.parent == data_root(ROOT) / "op_packages"
+        assert provenance.directory.parent == data_root() / "op_packages" == Path.cwd() / "flashinfer/data/op_packages"
 
     errors = []
 

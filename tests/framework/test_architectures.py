@@ -275,6 +275,7 @@ def test_current_csrc_native_probe_builds_and_executes_on_available_device(tmp_p
     if adapter is None:
         adapter = tmp_path / "adapter"
         build_adapter(adapter)
+    from tests.support.multiarch_case import probe_environment
     result = subprocess.run(
         [
             sys.executable,
@@ -285,6 +286,7 @@ def test_current_csrc_native_probe_builds_and_executes_on_available_device(tmp_p
             str(package.parent),
             str(adapter),
         ],
+        env=probe_environment(package.parent, descriptor, spec),
         capture_output=True,
         text=True,
         timeout=180,
@@ -416,6 +418,9 @@ def test_target_mapping_is_part_of_the_frozen_driver_identity(tmp_path, monkeypa
     target_mapping = package / 'runtime/targets.py'
     driver.parent.mkdir(parents=True)
     target_mapping.parent.mkdir(parents=True)
+    (package / 'aclnn').mkdir()
+    host_build = package / 'aclnn/build.py'
+    host_build.write_text('# typed Torch package compiler\n')
     driver.write_text('# compiler driver\n')
     driver.with_name('op_package.py').write_text('# package target consumer\n')
     target_mapping.write_text('SOC_TARGETS = {"Ascend910C": "ascend910_93"}\n')
@@ -423,3 +428,6 @@ def test_target_mapping_is_part_of_the_frozen_driver_identity(tmp_path, monkeypa
     before = ascendc._driver_identity()
     target_mapping.write_text('SOC_TARGETS = {"Ascend910C": "changed_compute_unit"}\n')
     assert ascendc._driver_identity() != before
+    after_mapping = ascendc._driver_identity()
+    host_build.write_text('# changed typed Torch package compiler\n')
+    assert ascendc._driver_identity() != after_mapping

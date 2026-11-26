@@ -9,13 +9,12 @@
 | `packaging/` | AOT/ACLNN 产物、损坏与缺包拒绝、wheel/sdist 与安装后验证 |
 | `support/` | 共享测试辅助、独立参考脚本，以及需要进程隔离的交付验证 |
 | `framework/data/production_capabilities.json` | 独立冻结的能力基线，防止既有支持范围意外变化 |
-| `packaging/data/legacy_ascendc/` | 旧格式兼容与拒绝测试的固定 ABI 样本和源码闭包 |
 
-CATLASS 独立参考脚本位于 `support/catlass_golden.py`，按原始源码 SHA256 校验。固定 ABI 样本和能力基线分别由构建交付与框架测试目录维护。
+CATLASS 独立参考脚本位于 `support/catlass_golden.py`，按原始源码 SHA256 校验。打包测试使用当前 v2 声明，能力基线由框架测试维护。
 
 新增实现的独立预期放在 `inventory/<op>.py`，`production_inventory.py` 汇总这些记录和冻结基线。`framework/test_replay_param_*.py` 是图参数更新的协议与真机测试入口，其路径同时用于图能力声明和证据审计。
 
-根目录 `conftest.py` 是 pytest 自动发现的插件加载入口，公共逻辑位于 `support/pytest_plugin.py`：SoC 选择、设备初始化、路由缓存隔离和共享单元测试夹具。`operators/conftest.py` 将设备、格式及 AOT 准备限定在算子精度测试范围。`framework/test_replay_param_runtime.py` 检查图参数更新的状态、资源与异常清理；`framework/test_replay_param_npu.py` 在声明匹配的 A5 设备上验证实际 capture/update/replay 与 eager 结果。
+pytest 自动加载 `tests/conftest.py`，在其中选择 SoC 和设备、隔离路由缓存并提供共享测试夹具。独立设备进程从 `FLASHINFER_TEST_NPU_DEVICE` 读取同一设备索引。`operators/conftest.py` 将设备、格式及 AOT 准备限定在算子精度测试范围。`framework/test_replay_param_runtime.py` 检查图参数更新的状态、资源与异常清理；`framework/test_replay_param_npu.py` 在声明匹配的 A5 设备上验证实际 capture/update/replay 与 eager 结果。
 
 ## 算子精度
 

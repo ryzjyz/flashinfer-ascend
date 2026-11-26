@@ -19,7 +19,7 @@ def main(request_path: Path) -> None:
 
     from flashinfer.jit.core import JitSpec
     from flashinfer.runtime.hardware import _normalize_soc_model
-    from flashinfer.jit._triton_abi import triton_binary_mode, verify_triton_symbols
+    from flashinfer.jit._triton_abi import task_queue_enabled, triton_binary_mode, verify_triton_symbols
 
     directory = request_path.parent
     request = json.loads(request_path.read_text())
@@ -90,7 +90,7 @@ def main(request_path: Path) -> None:
     (directory / "triton.json").write_text(json.dumps({
         "schema_version": 1, "spec_fingerprint": spec.fingerprint,
         "entry_point": entry, "hash": kernel.hash,
-        "binary_mode": binary_mode,
+        "binary_mode": binary_mode, "task_queue": task_queue_enabled(),
         "target": {"backend": target.backend, "arch": target.arch, "warp_size": target.warp_size},
         "versions": versions, "arg_names": function.arg_names,
         "signature": signature, "constexprs": constants,

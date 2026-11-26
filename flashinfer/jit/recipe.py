@@ -7,8 +7,10 @@ dependency closure is read, and the result is bound into the ordinary JitSpec.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import cached_property
 import hashlib
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 from typing import Mapping, Optional, Tuple, Union
@@ -24,7 +26,20 @@ _LEGACY_CATLASS_REVISION = "41bf90da655bba3c66d0acd7e00abe33960ecfd6"
 _SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _TENSOR_DTYPES = frozenset({
     "bfloat16", "float16", "float32", "float64", "int8", "uint8", "int16", "int32", "int64", "bool",
+    "uint16", "uint32", "uint64", "complex32", "complex64", "complex128", "uint1", "int4",
+    "float8_e5m2", "float8_e4m3fn", "float8_e8m0fnu", "float4_e2m1fn_x2",
 })
+
+
+def _matching_signatures(choices, declared, message):
+    # An empty/absent slot supplies no dtype. Every observed combination in the
+    # remaining slots needs an explicit signature, including heterogeneous lists.
+    known = [i for i, values in enumerate(choices) if values]
+    matched = [s for s in declared if all(s[i] in choices[i] for i in known)]
+    observed = {tuple(s[i] for i in known) for s in matched}
+    if len(observed) != math.prod(len(choices[i]) for i in known):
+        raise SchemaError(message)
+    return matched
 
 
 def _path(value):
@@ -82,6 +97,8 @@ class TensorParameter:
     # Additive exact-alias declaration for mutation-only outputs. The named
     # input and this output must share one storage view and independent strides.
     alias_of: Optional[str] = None
+    tensor_list: bool = False
+    device: str = "npu"
 
     def __post_init__(self):
         if (not isinstance(self.name, str) or not _SYMBOL.fullmatch(self.name)
@@ -98,6 +115,10 @@ class TensorParameter:
         object.__setattr__(self, "shape", tuple(self.shape))
         if type(self.optional) is not bool or self.optional and self.role != "input":
             raise SchemaError("only input Tensor parameters may be optional")
+        if type(self.tensor_list) is not bool or self.device not in ("npu", "cpu"):
+            raise SchemaError("Invalid ACLNN tensor list/device declaration")
+        if self.tensor_list and self.native_conversions or self.device == "cpu" and self.role != "input":
+            raise SchemaError("Packed TensorList or host output requires a different data representation")
         layouts = tuple(self.physical_layouts)
         if not layouts or len(set(layouts)) != len(layouts) or set(layouts) - {"ND", "NZ"}:
             raise SchemaError("Tensor physical_layouts must explicitly declare ND/NZ")
@@ -131,7 +152,8 @@ class TensorParameter:
         value = asdict(self)
         for name, default in (("optional", False), ("physical_layouts", ("ND",)),
                               ("shape_alternatives", ()), ("native_conversions", ()),
-                              ("optional_for_dtypes", ()), ("alias_of", None)):
+                              ("optional_for_dtypes", ()), ("alias_of", None),
+                              ("tensor_list", False), ("device", "npu")):
             if getattr(self, name) == default:
                 value.pop(name)
         return value
@@ -324,8 +346,13 @@ class _Recipe:
                     or aliased.shape != parameter.shape
                     or aliased.shape_alternatives != parameter.shape_alternatives
                     or aliased.physical_layouts != parameter.physical_layouts
+                    or parameter.physical_layouts != ("ND",)
+                    or parameter.tensor_list or parameter.device != "npu"
+                    or parameter.native_conversions
+                    or aliased.optional or aliased.tensor_list or aliased.device != "npu"
+                    or aliased.native_conversions
                     or parameter.name in alias_outputs):
-                raise SchemaError("Tensor alias_of must bind one matching input")
+                raise SchemaError("Tensor alias_of must bind one matching required ND input")
             alias_outputs.add(parameter.name)
         # CANN-generated ACLNN APIs place input tensors before output tensors.
         roles = [p.role for p in parameters]
@@ -347,7 +374,7 @@ class _Recipe:
                 or {c.name for c in constraints} != symbols):
             raise SchemaError("shape_constraints must bind every tensor shape symbol exactly once")
 
-    @property
+    @cached_property
     def tensor_parameter_names(self):
         """ACLNN stage-one order; the frozen probe ABI supplies the v1 default."""
         return tuple(p.name for p in self.tensor_parameters) if self.schema_version == 2 else ("a", "b", "c")
@@ -367,11 +394,11 @@ class _Recipe:
         return tuple(tuple(p.native_type(dtype) for p, dtype in zip(self.tensor_parameters, signature))
                      for signature in self.tensor_dtype_signatures)
 
-    @property
+    @cached_property
     def extended_aclnn(self):
-        return bool(self.attributes or any(p.optional or p.physical_layouts != ("ND",)
-                                         or p.native_conversions or p.alias_of
-                                         for p in self.tensor_parameters))
+        return bool(self.attributes or any(
+            p.optional or p.tensor_list or p.device == "cpu" or p.physical_layouts != ("ND",)
+            or p.native_conversions or p.alias_of for p in self.tensor_parameters))
 
     @property
     def alias_pairs(self):
@@ -401,6 +428,19 @@ class _Recipe:
                               % (actual, self.tensor_parameter_names))
         return actual
 
+    @cached_property
+    def _list_local_dimensions(self):
+        # Axes shared with another parameter describe a common extent. An axis
+        # unique to one dynamic list can take a different value in each member.
+        owners = {}
+        lists = {p.name for p in self.tensor_parameters if p.tensor_list}
+        for p in self.tensor_parameters:
+            for shape in (p.shape,) + p.shape_alternatives:
+                for axis in shape:
+                    if isinstance(axis, str):
+                        owners.setdefault(axis, set()).add(p.name)
+        return {axis for axis, params in owners.items() if len(params) == 1 and params <= lists}
+
     def validate_tensor_metadata(self, *, shapes, dtypes):
         """Reject unsupported v2 metadata before dispatch can resolve/build a unit.
 
@@ -419,28 +459,30 @@ class _Recipe:
             if (p.name in absent and p.optional_for_dtypes and not any(
                     dtypes[self.tensor_parameters[index].name] == dtype for index, dtype in p.optional_for_dtypes)):
                 raise SchemaError("Tensor %s is required for this dtype combination" % p.name)
-        dtype_values = dict(dtypes)
-        for p in self.tensor_parameters:
-            if p.name in absent:
-                if dtypes[p.name] is not None:
-                    raise SchemaError("absent Tensor must have absent dtype metadata")
-                dtype_values[p.name] = p.dtype
-        if absent:
-            # An absent optional Tensor has no dtype. Resolve its placeholder
-            # from one coherent declared signature, constrained by EVERY
-            # present Tensor; do not invent an extra executable combination.
-            for candidate in self.tensor_dtype_signatures:
-                if all(p.name in absent or dtypes[p.name] == dtype
-                       for p, dtype in zip(self.tensor_parameters, candidate)):
-                    dtype_values.update((p.name, dtype) for p, dtype in zip(self.tensor_parameters, candidate)
-                                        if p.name in absent)
-                    break
-        self.validate_tensor_dtypes(dtype_values)
-        dimensions = {}
+        members, choices = [], []
         for parameter in self.tensor_parameters:
-            if parameter.name in absent:
-                continue
-            shape = tuple(shapes[parameter.name])
+            name = parameter.name
+            if name in absent:
+                if dtypes[name] is not None:
+                    raise SchemaError("absent Tensor must have absent dtype metadata")
+                choices.append(set())
+            elif parameter.tensor_list:
+                shapes_list, dtypes_list = shapes[name], dtypes[name]
+                if (not isinstance(shapes_list, (tuple, list)) or not isinstance(dtypes_list, (tuple, list))
+                        or len(shapes_list) != len(dtypes_list)):
+                    raise SchemaError("ACLNN TensorList shape/dtype count mismatch: " + name)
+                choices.append(set(dtypes_list))
+                members.extend((parameter, tuple(shape)) for shape in shapes_list)
+            else:
+                choices.append({dtypes[name]})
+                members.append((parameter, tuple(shapes[name])))
+        if absent or any(p.tensor_list for p in self.tensor_parameters):
+            _matching_signatures(choices, self.tensor_dtype_signatures, "ACLNN Tensor/List dtype signature is not a declared combination")
+        else:
+            self.validate_tensor_dtypes(dtypes)
+        dimensions, list_dimensions = {}, {}
+        for parameter, shape in members:
+            member = {}
             variants = (parameter.shape,) + parameter.shape_alternatives
             declared_shape = next((s for s in variants if len(s) == len(shape)), None)
             if declared_shape is None:
@@ -450,26 +492,31 @@ class _Recipe:
                 if type(actual) is not int or actual < 1:
                     raise SchemaError("dispatch shape for %s requires positive integer dimensions" % parameter.name)
                 if isinstance(declared, str):
-                    if declared in dimensions and dimensions[declared] != actual:
+                    axes = member if parameter.tensor_list and declared in self._list_local_dimensions else dimensions
+                    if declared in axes and axes[declared] != actual:
                         raise SchemaError("dispatch shape symbol %s is inconsistent across tensor arguments" % declared)
-                    dimensions[declared] = actual
+                    axes[declared] = actual
                 elif actual != declared:
                     raise SchemaError("dispatch shape for %s requires dimension %d; got %d"
                                       % (parameter.name, declared, actual))
+            for axis, value in member.items():
+                list_dimensions.setdefault(axis, []).append(value)
         for constraint in self.shape_constraints:
-            if constraint.name not in dimensions:
-                continue
-            actual = dimensions[constraint.name]
-            if not constraint.minimum <= actual <= constraint.maximum or actual % constraint.multiple_of:
-                raise SchemaError("dispatch shape %s=%d is outside declared range [%d, %d], multiple_of=%d"
-                                  % (constraint.name, actual, constraint.minimum,
-                                     constraint.maximum, constraint.multiple_of))
+            name = constraint.name
+            values = (dimensions[name],) if name in dimensions else list_dimensions.get(name, ())
+            for actual in values:
+                if not constraint.minimum <= actual <= constraint.maximum or actual % constraint.multiple_of:
+                    raise SchemaError("dispatch shape %s=%d is outside declared range [%d, %d], multiple_of=%d"
+                                      % (name, actual, constraint.minimum, constraint.maximum, constraint.multiple_of))
+        dimensions.update((axis, tuple(values)) for axis, values in list_dimensions.items())
         return dimensions
 
     def to_dict(self):
         value = asdict(self)
         if not self.attributes:
             value.pop("attributes")
+        else:
+            value["attributes"] = tuple(a.to_dict() for a in self.attributes)
         if not self.extra_build_files:
             value.pop("extra_build_files")
         else:
@@ -609,7 +656,7 @@ def load_build_recipes(path):
 
 @dataclass(frozen=True)
 class AscendCBuildConfig(_BuildConfig):
-    """Select a v2 ACLNN recipe; raw host launch is an internal test facility."""
+    """Select a public v2 ACLNN op-package recipe."""
 
     output_kind: str = "op_package"
 
@@ -698,7 +745,9 @@ class ResolvedBuildRecipe:
 
 
 def _build_inputs(recipe):
-    adapter_inputs = (("csrc/cmake/operator/aclnn_adapter.py",)
+    adapter_inputs = (("csrc/cmake/operator/aclnn_adapter.py",
+                     *("csrc/aclnn_torch_adapter/" + f for f in ("call.h", "aclnn_adapter.h", "op_api_common.h",
+                         "NPUBridge.h", "NPUBridge.cpp", "NPUStorageImpl.h")))
                       if recipe.schema_version == 2 and recipe.output_kind == "op_package" else ())
     if recipe.extra_build_files:
         return ("csrc/cmake/operator/CMakeLists.txt", "csrc/cmake/operator/OpPackage.cmake",

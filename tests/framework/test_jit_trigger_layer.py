@@ -481,7 +481,7 @@ attempts = []
 compiler_probes = []
 class NoCompilerPackages(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'triton', 'torch', 'torch_npu', 'cann'}:
+        if fullname.split('.')[0] in {'triton', 'torch', 'torch_npu', 'cann', 'catlass'}:
             attempts.append(fullname)
             raise ModuleNotFoundError('optional dependency blocked: ' + fullname)
 sys.meta_path.insert(0, NoCompilerPackages())

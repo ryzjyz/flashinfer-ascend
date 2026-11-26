@@ -107,6 +107,8 @@ class AotKernelRunner:
 
     def resolve(self):
         """Only AotMissingError authorizes the explicitly enabled JIT branch."""
+        if self._runner is not None:
+            return self._runner
         from .discovery import AotLoadError, AotMissingError, get_op_package_index
 
         with self._lock:
@@ -171,8 +173,8 @@ class AotKernelRunner:
             if not callable(runner):
                 raise TypeError("AOT runner_factory must return a callable")
             self._module = module
-            self._runner = runner
             self._provenance = provenance
+            self._runner = runner
             _logger.info("Bound %s kernel=%s spec=%s directory=%s", provenance.source,
                          self.spec.kernel_id, provenance.spec_fingerprint, provenance.directory)
             return runner

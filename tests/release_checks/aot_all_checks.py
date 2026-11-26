@@ -5,6 +5,7 @@ from tests.production_inventory import PRODUCTION
 from dataclasses import replace
 import json
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -75,12 +76,26 @@ def test_all_inventory_automatically_includes_new_registered_contract(monkeypatc
     monkeypatch.setattr(build, "AscendCBackend", lambda **kwargs: backends.append(kwargs) or object())
     published = []
 
-    def publish(recipe, spec, backend, store, output_dir):
+    first, second, *_ = contracts
+    second_started = Event()
+
+    def compile_unit(unit, store):
+        spec = unit[1]
+        if spec.kernel_id == first:
+            assert second_started.wait(10), "independent packages must compile concurrently"
+        elif spec.kernel_id == second:
+            second_started.set()
+        return spec
+
+    monkeypatch.setattr(build, "_build_package", compile_unit)
+
+    def publish(recipe, spec, compiled_spec, store, output_dir):
+        assert compiled_spec is spec
         published.append((recipe, spec))
         return Path(output_dir) / spec.fingerprint
 
     monkeypatch.setattr(build, "_publish", publish)
-    outputs = build.build_production_packages(output_dir=tmp_path / "release")
+    outputs = build.build_production_packages(output_dir=tmp_path / "release", jobs=2)
     assert [recipe.kernel_id for recipe, _ in published] == list(contracts)
     assert all(spec is contracts[recipe.kernel_id][2] for recipe, spec in published)
     assert len(outputs) == len(backends) == len(PRODUCTION) + 1

@@ -13,13 +13,8 @@ from __future__ import annotations
 
 from typing import Optional, Union
 
-from .runtime import (
-    Backend,
-    build_signature,
-    current_hardware,
-    dispatch,
-)
-from .runtime.runner import run_selected as _run_selected
+from .runtime import Backend, current_hardware
+from .runtime.runner import run_operator
 from .runtime.registry import get_global_registry as get_global_registry
 
 _OP_RMSNORM = "norm.rmsnorm"
@@ -84,15 +79,11 @@ def rmsnorm(
 
 def _rmsnorm_impl(out, input, weight, eps, backend, kernel_id):
     """Original eager dispatch, also used inside the opaque registered op."""
-    signature = build_signature(
-        _OP_RMSNORM,
-        (input, weight),
-        specializations={"eps": float(eps)},
+    run_operator(
+        _OP_RMSNORM, (input, weight), (out, input, weight, float(eps)),
+        specializations={"eps": float(eps)}, backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
     )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(decision.kernel_id, out, input, weight, float(eps))
 
 
 def fused_add_rmsnorm(
@@ -140,15 +131,11 @@ def fused_add_rmsnorm(
 
 def _fused_add_rmsnorm_impl(input, residual, weight, eps, backend, kernel_id):
     """Original eager dispatch; input and residual are both mutated by the runner."""
-    signature = build_signature(
-        _OP_FUSED_ADD_RMSNORM,
-        (input, residual, weight),
-        specializations={"eps": float(eps)},
+    run_operator(
+        _OP_FUSED_ADD_RMSNORM, (input, residual, weight), (input, residual, weight, float(eps)),
+        specializations={"eps": float(eps)}, backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
     )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(decision.kernel_id, input, residual, weight, float(eps))
 
 
 def gemma_rmsnorm(
@@ -172,15 +159,11 @@ def gemma_rmsnorm(
 
     if out is None:
         out = torch.empty_like(input)
-    signature = build_signature(
-        _OP_GEMMA_RMSNORM,
-        (input, weight),
-        specializations={"eps": float(eps)},
+    run_operator(
+        _OP_GEMMA_RMSNORM, (input, weight), (out, input, weight, float(eps)),
+        specializations={"eps": float(eps)}, backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
     )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(decision.kernel_id, out, input, weight, float(eps))
     return out
 
 
@@ -204,15 +187,11 @@ def gemma_fused_add_rmsnorm(
     ``gamma + 1``），默认走 Triton 自定义 kernel。
     """
     del enable_pdl  # 上游在非 CUDA 设备上同样关闭 PDL，语义兼容
-    signature = build_signature(
-        _OP_GEMMA_FUSED_ADD_RMSNORM,
-        (input, residual, weight),
-        specializations={"eps": float(eps)},
+    run_operator(
+        _OP_GEMMA_FUSED_ADD_RMSNORM, (input, residual, weight),
+        (input, residual, weight, float(eps)), specializations={"eps": float(eps)},
+        backend=backend, kernel_id=kernel_id, hardware=current_hardware(),
     )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(decision.kernel_id, input, residual, weight, float(eps))
 
 
 def layernorm(
@@ -233,15 +212,11 @@ def layernorm(
     import torch
 
     out = torch.empty_like(input)
-    signature = build_signature(
-        _OP_LAYERNORM,
-        (input, gemma, beta),
-        specializations={"eps": float(eps)},
+    run_operator(
+        _OP_LAYERNORM, (input, gemma, beta), (out, input, gemma, beta, float(eps)),
+        specializations={"eps": float(eps)}, backend=backend, kernel_id=kernel_id,
+        hardware=current_hardware(),
     )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(decision.kernel_id, out, input, gemma, beta, float(eps))
     return out
 
 

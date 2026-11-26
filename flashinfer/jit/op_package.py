@@ -21,7 +21,7 @@ from flashinfer.runtime import ArtifactFormat, SchemaError
 
 from ._elf import elf_symbols
 from .core import JitSpec, _canonical_hash
-from .recipe import _Recipe, _recipe_from_artifact, _path
+from .recipe import _Recipe, _matching_signatures, _recipe_from_artifact, _path
 
 
 OP_PACKAGE_ADAPTER_HASH = _canonical_hash("ascendc.op_package.v1")
@@ -57,7 +57,7 @@ def _file(root, relative):
     return path
 
 
-def collect_package(spec, recipe, build, directory):
+def collect_package(spec, recipe, build, directory, *, source_root, toolchain):
     """Collect only CPack's staged standard vendor tree and installer, never run it."""
     vendors = list(build.glob("_CPack_Packages/*/External/*.run/packages/vendors/" + recipe.package_vendor))
     installers = list(build.glob("*.run"))
@@ -74,7 +74,10 @@ def collect_package(spec, recipe, build, directory):
         for suffix in (".cpp", ".json", ".h"):
             shutil.copyfile(build / ("fi_aclnn_adapter" + suffix),
                             directory / ("fi_aclnn_adapter" + suffix))
-        data.update(schema_version=2, native_adapter="fi_aclnn_adapter.json")
+        from flashinfer.aclnn.build import build_package_call, torch_abi
+        build_package_call(build / "fi_aclnn_submit.cpp", directory / "fi_aclnn_submit.so", source_root,
+                           cann_root=toolchain.cann_root, compiler=toolchain.host_compiler)
+        data.update(schema_version=2, native_adapter="fi_aclnn_adapter.json", torch_abi=torch_abi())
     (directory / spec.output_path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     verify_op_package(directory, spec)
 
@@ -93,7 +96,7 @@ def verify_op_package(directory, spec):
     fields = {"schema_version", "output_adapter", "spec_fingerprint", "recipe",
               "vendor_path", "api_library", "compute_unit", "run_file"}
     if data.get("schema_version") == 2:
-        fields.add("native_adapter")
+        fields.update(("native_adapter", "torch_abi"))
     if set(data) != fields:
         raise SchemaError("invalid op-package manifest fields")
     recipe = _recipe_from_artifact(data["recipe"])
@@ -116,6 +119,10 @@ def verify_op_package(directory, spec):
             raise OpPackageSymbolError("op-package host ELF has no ACLNN symbol: " + entry)
     if data["schema_version"] == 2:
         _verify_native_adapter(directory, data, recipe, symbols)
+        submit = elf_symbols(_file(directory, "fi_aclnn_submit.so").read_bytes(),
+                             machine=machines[platform.machine()], elf_type=3, dynamic_only=True)
+        if not {"fi_submit", "fi_submit_identity"} <= submit:
+            raise OpPackageSymbolError("Missing typed ACLNN submission entry")
     kernel = vendor + "/op_impl/ai_core/tbe/kernel/"
     config = json.loads(_file(directory, kernel + "config/" + compute + "/binary_info_config.json").read_text())
     if set(config) != {recipe.package_op_type}:
@@ -173,27 +180,13 @@ def verify_op_package(directory, spec):
             support = metadata.get("supportInfo", {})
             if support.get("opMode") != "dynamic":
                 raise SchemaError("v2 package metadata must declare dynamic host tiling")
-            for role, key in (("input", "inputs"), ("output", "outputs")):
-                declared = [p.name for p in recipe.tensor_parameters if p.role == role]
-                packaged = [p.get("name") for p in support.get(key, ())]
-                if packaged != declared:
-                    raise SchemaError("v2 package tensor parameter order/types differ from recipe: " + role)
-            signature = tuple(p.get("dtype") for key in ("inputs", "outputs") for p in support.get(key, ()))
-            if signature not in recipe.native_dtype_signatures:
-                raise SchemaError("v2 package tensor parameter order/types differ from recipe: dtype signature")
+            dtype_signatures.update(_binary_tensor_signatures(recipe, support))
             if recipe.extended_aclnn:
-                packaged_parameters = tuple(p for key in ("inputs", "outputs") for p in support.get(key, ()))
-                for declared, packaged in zip(recipe.tensor_parameters, packaged_parameters):
-                    layout = {"ND": "ND", "FRACTAL_NZ": "NZ"}.get(packaged.get("format"))
-                    if (layout not in declared.physical_layouts
-                            or (packaged.get("paramType") == "optional") != declared.optional):
-                        raise SchemaError("extended package Tensor format/optionality differs from recipe")
                 attributes = support.get("attrs", ())
-                expected = [(a.name, {"bool": "bool", "int64": "int", "float64": "float", "string": "str"}[a.dtype])
+                expected = [(a.name, a.opdef_dtype)
                             for a in recipe.attributes]
                 if [(a.get("name"), a.get("dtype")) for a in attributes] != expected:
                     raise SchemaError("extended package attribute order/types differ from recipe")
-            dtype_signatures.add(signature)
             if (recipe.workspace_bytes == "dynamic"
                     and metadata.get("workspace", {}).get("size") != [-1]):
                 raise SchemaError("v2 dynamic workspace must have a host-computed metadata size")
@@ -203,6 +196,30 @@ def verify_op_package(directory, spec):
         raise SchemaError("v2 package is missing a declared dtype signature executable")
     _file(directory, data["run_file"])
     return data, recipe
+
+
+def _binary_tensor_signatures(recipe, support):
+    """CANN represents each dynamic OpDef slot as a group of tensor records."""
+    choices = []
+    for role, key in (("input", "inputs"), ("output", "outputs")):
+        declared = [p for p in recipe.tensor_parameters if p.role == role]
+        slots = support.get(key, ())
+        if len(slots) != len(declared):
+            raise SchemaError("v2 package tensor parameter order/types differ from recipe: " + role)
+        for parameter, slot in zip(declared, slots):
+            members = slot if isinstance(slot, list) else [slot]
+            if (not members or not parameter.tensor_list and isinstance(slot, list)
+                    or any(not isinstance(p, dict) or p.get("name") != parameter.name for p in members)):
+                raise SchemaError("v2 package tensor parameter order/types differ from recipe: " + role)
+            if recipe.extended_aclnn:
+                expected = "dynamic" if parameter.tensor_list else "optional" if parameter.optional else "required"
+                for p in members:
+                    layout = {"ND": "ND", "FRACTAL_NZ": "NZ"}.get(p.get("format"))
+                    if layout not in parameter.physical_layouts or p.get("paramType") != expected:
+                        raise SchemaError("extended package Tensor format/optionality differs from recipe")
+            choices.append({p.get("dtype") for p in members})
+    return _matching_signatures(choices, recipe.native_dtype_signatures,
+                                "v2 package tensor parameter order/types differ from recipe: dtype signature")
 
 
 def _verify_native_adapter(directory, data, recipe, symbols):
@@ -224,8 +241,7 @@ def _verify_native_adapter(directory, data, recipe, symbols):
         payload = _file(directory, "fi_aclnn_adapter" + suffix).read_bytes()
         if hashlib.sha256(payload).hexdigest() != record[key]:
             raise SchemaError("generated ACLNN adapter source/header digest mismatch")
-    required = {"fi_aclnn_binding_fingerprint", "fi_aclnn_workspace", "fi_aclnn_launch"}
-    if not required <= symbols:
+    if "fi_aclnn_binding_fingerprint" not in symbols:
         raise OpPackageSymbolError("op-package is missing its generated ACLNN adapter symbols")
 
 
@@ -235,17 +251,7 @@ _active_package = None
 
 @dataclass(frozen=True)
 class OpPackageModule:
-    """Owns ACLNN function pointers; caller owns ACL tensors, stream and workspace.
-
-    get_workspace_size(*tensors) accepts recipe-ordered aclTensor* and returns
-    (bytes, aclOpExecutor*). Named arguments are reordered from the same recipe.
-    launch(workspace,bytes,executor,stream) is stage two. The host tiling callback
-    computes workspace and writes the tiling data: CANN's executor transports
-    that data as the device kernel's last GM buffer argument, after workspace.
-    It is deliberately not an extra aclTensor argument to GetWorkspaceSize.
-    Both stages raise on any nonzero CANN status. Successful dlopen alone does
-    not claim execution or numerical correctness.
-    """
+    """Owns a verified vendor library and its typed Torch submission library."""
 
     recipe: _Recipe
     vendor_path: Path
@@ -254,35 +260,8 @@ class OpPackageModule:
     # the active module's process lifetime. No second copy/cache is created.
     registration_path: Optional[Path] = None
     _registration_fd: Optional[int] = field(default=None, repr=False, compare=False)
+    call_path: Optional[Path] = None
 
-    def get_workspace_size(self, *tensors, **named_tensors):
-        import ctypes as C
-
-        names = self.recipe.tensor_parameter_names
-        attributes = {a.name: named_tensors.pop(a.name) for a in self.recipe.attributes if a.name in named_tensors}
-        scalar_values = self.recipe.validate_attributes(attributes)
-        scalar_values = tuple(value.encode("utf-8") if parameter.dtype == "string" else value
-                              for parameter, value in zip(self.recipe.attributes, scalar_values))
-        if named_tensors:
-            if tensors or set(named_tensors) != set(names):
-                raise SchemaError("ACLNN tensor arguments must match recipe order: " + ", ".join(names))
-            tensors = tuple(named_tensors[name] for name in names)
-        if len(tensors) != len(names):
-            raise SchemaError("ACLNN requires %d tensor arguments (%s); got %d"
-                              % (len(names), ", ".join(names), len(tensors)))
-        size, executor = C.c_uint64(), C.c_void_p()
-        inputs = sum(p.role == "input" for p in self.recipe.tensor_parameters) if self.recipe.schema_version == 2 else len(names)
-        status = getattr(self.api, self.recipe.host_entry + "GetWorkspaceSize")(
-            *tensors[:inputs], *scalar_values, *tensors[inputs:], C.byref(size), C.byref(executor))
-        if status or not executor.value:
-            raise RuntimeError("%sGetWorkspaceSize returned %s; executor=%s"
-                               % (self.recipe.host_entry, status, executor.value))
-        return size.value, executor
-
-    def launch(self, workspace, workspace_bytes, executor, stream):
-        status = getattr(self.api, self.recipe.host_entry)(workspace, workspace_bytes, executor, stream)
-        if status:
-            raise RuntimeError("%s returned %s" % (self.recipe.host_entry, status))
 
 
 def load_op_packages(directories, *, target_soc):
@@ -352,29 +331,24 @@ def load_op_packages(directories, *, target_soc):
                     paths.append(previous)
                 os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(paths)
             for name, (directory, record, data, recipe) in pending.items():
+                if data["schema_version"] == 2:
+                    from flashinfer.aclnn.build import torch_abi
+                    if data["torch_abi"] != torch_abi():
+                        raise SchemaError("typed ACLNN package Torch/torch_npu build identity mismatch")
                 api = C.CDLL(str(_file(directory, data["api_library"])), mode=C.RTLD_LOCAL)
                 if data["schema_version"] == 2:
                     identity = api.fi_aclnn_binding_fingerprint
                     identity.argtypes, identity.restype = [], C.c_char_p
                     if identity() != recipe.fingerprint.encode("ascii"):
                         raise SchemaError("loaded ACLNN adapter identity differs from its operator")
-                    # All callers use the generated, header-checked wrappers.
-                    setattr(api, recipe.host_entry + "GetWorkspaceSize", api.fi_aclnn_workspace)
-                    setattr(api, recipe.host_entry, api.fi_aclnn_launch)
-                workspace = getattr(api, recipe.host_entry + "GetWorkspaceSize")
-                inputs = sum(p.role == "input" for p in recipe.tensor_parameters) if recipe.schema_version == 2 else len(recipe.tensor_parameter_names)
-                scalar_types = [{"bool": C.c_bool, "int64": C.c_int64, "float64": C.c_double, "string": C.c_char_p}[a.dtype]
-                                for a in recipe.attributes]
-                workspace.argtypes = ([C.c_void_p] * inputs + scalar_types
-                                      + [C.c_void_p] * (len(recipe.tensor_parameter_names) - inputs)
-                                      + [C.POINTER(C.c_uint64), C.POINTER(C.c_void_p)])
-                workspace.restype = C.c_int
-                launch = getattr(api, recipe.host_entry)
-                launch.argtypes = [C.c_void_p, C.c_uint64, C.c_void_p, C.c_void_p]
-                launch.restype = C.c_int
+                # Resolve both vendor entries before committing this registration or its fd.
+                # ctypes caches the two verified function objects on the library handle.
+                getattr(api, recipe.host_entry + "GetWorkspaceSize")
+                getattr(api, recipe.host_entry)
                 vendor, registration_path, registration_fd = aliases[name]
                 loaded[name] = record.fingerprint, OpPackageModule(
-                    recipe, vendor, api, registration_path, registration_fd)
+                    recipe, vendor, api, registration_path, registration_fd,
+                    _file(directory, "fi_aclnn_submit.so") if recipe.schema_version == 2 else None)
         except Exception:
             for _, _, fd in aliases.values():
                 if fd is not None:

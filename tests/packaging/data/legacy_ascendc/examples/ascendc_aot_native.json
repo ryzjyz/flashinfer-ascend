@@ -1,5 +1,0 @@
-{
-  "implementation": "native",
-  "output_kind": "op_package",
-  "target_soc": "Ascend950"
-}

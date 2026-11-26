@@ -7,7 +7,7 @@ from typing import Tuple, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-from .runtime import build_signature, current_hardware, dispatch, get_global_registry
+from .runtime.runner import run_operator
 
 
 def append_paged_kv_cache(
@@ -21,11 +21,13 @@ def append_paged_kv_cache(
     kv_last_page_len: torch.Tensor,
     kv_layout: str = "NHD",
 ) -> None:
-    signature = build_signature("page.append_paged_kv_cache", (append_key,), layouts=(kv_layout,))
-    decision = dispatch(signature, current_hardware(), backend=None)
-    return get_global_registry().get(decision.kernel_id).runner(
-        append_key, append_value, batch_indices, positions, paged_kv_cache,
-        kv_indices, kv_indptr, kv_last_page_len, kv_layout,
+    return run_operator(
+        "page.append_paged_kv_cache", (append_key,),
+        (
+            append_key, append_value, batch_indices, positions, paged_kv_cache, kv_indices,
+            kv_indptr, kv_last_page_len, kv_layout,
+        ),
+        layouts=(kv_layout,),
     )
 
 

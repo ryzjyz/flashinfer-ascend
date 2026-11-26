@@ -208,6 +208,10 @@ def test_three_targets_compile_and_one_runner_executes_on_available_real_device(
     if adapter is None:
         adapter = tmp_path / "adapter"
         build_adapter(adapter)
+    from flashinfer.runtime import current_hardware
+    from tests.support.multiarch_case import probe_environment
+    target = current_hardware().soc_model
+    local_descriptor, _, local_spec = next(c for c in contracts if c[1].target_soc == target)
     result = subprocess.run(
         [
             sys.executable,
@@ -218,6 +222,7 @@ def test_three_targets_compile_and_one_runner_executes_on_available_real_device(
             str(release),
             str(adapter),
         ],
+        env=probe_environment(release, local_descriptor, local_spec),
         capture_output=True,
         text=True,
         timeout=180,

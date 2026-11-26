@@ -49,21 +49,14 @@ def main(argv=None):
         command.extend(["-m", SCOPES[args.profile]])
     (logs / "command.json").write_text(json.dumps({"profile": args.profile, "soc": args.soc, "command": command,
                                                   "cwd": str(root)}, indent=2) + "\n")
-    environment = dict(os.environ)
-    if "FLASHINFER_TEST_NPU_DEVICE" in environment:
-        bootstrap = root / "tests/npu_device_bootstrap"
-        environment["PYTHONPATH"] = str(bootstrap) + (
-            os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else "")
-        (logs / "device.json").write_text(json.dumps({
-            "npu_device": environment["FLASHINFER_TEST_NPU_DEVICE"],
-            "bootstrap": str(bootstrap),
-        }, indent=2) + "\n")
+    if device := os.environ.get("FLASHINFER_TEST_NPU_DEVICE"):
+        (logs / "device.json").write_text(json.dumps({"npu_device": device}, indent=2) + "\n")
     print("profile=" + args.profile + "; log=" + str(logs / "pytest.log"), flush=True)
     if args.profile == "quick":
         print("Scope: real_compile is deselected; this run does not establish compiler or full coverage.", flush=True)
     started = time.monotonic()
     with (logs / "pytest.log").open("w") as output:
-        result = subprocess.run(command, cwd=root, env=environment, stdout=output, stderr=subprocess.STDOUT)
+        result = subprocess.run(command, cwd=root, stdout=output, stderr=subprocess.STDOUT)
     (logs / "pytest.exit").write_text(str(result.returncode) + "\n")
     summary = {"profile": args.profile, "soc": args.soc, "pytest_returncode": result.returncode,
                "elapsed_seconds": round(time.monotonic() - started, 3)}

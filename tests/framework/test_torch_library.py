@@ -157,8 +157,8 @@ def _forbidden(*args, **kwargs):
 
 
 def _forbid_runtime(monkeypatch):
-    for name in ("_rmsnorm_impl", "_fused_add_rmsnorm_impl", "build_signature",
-                 "current_hardware", "dispatch", "_run_selected", "get_global_registry"):
+    for name in ("_rmsnorm_impl", "_fused_add_rmsnorm_impl", "run_operator",
+                 "current_hardware", "get_global_registry"):
         monkeypatch.setattr(flashinfer.norm, name, _forbidden)
 
 

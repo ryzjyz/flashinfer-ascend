@@ -4,12 +4,19 @@
 from dataclasses import replace
 from pathlib import Path
 import platform
+import ctypes as C
+import errno
+import json
+import os
+from types import SimpleNamespace
 import shutil
 
 import pytest
 
-from flashinfer.jit._legacy_recipe import export_op_package
-from flashinfer.jit import discovery
+from flashinfer.aot.build import export_op_package
+from flashinfer.jit import discovery, op_package as package
+from flashinfer.jit.cache import verify_build_directory
+from flashinfer.runtime import SchemaError
 from flashinfer.jit import DiskJitBuildStore
 from flashinfer.jit.build import _verify_output
 from flashinfer.jit.discovery import (
@@ -20,7 +27,7 @@ from flashinfer.runtime import Backend, CompileMode, KernelDescriptor, KernelLau
 
 # Reuse the existing verifier's synthetic ELF/store fixture; these bytes are
 # never executed. End-to-end tests separately compile and execute real packages.
-from tests.packaging.test_ascendc_op_package import elf_fixture, generation, unit, write_fixture
+from tests.packaging.test_ascendc_op_package import elf_fixture, fake_runtime, generation, unit, write_fixture
 
 
 @pytest.fixture
@@ -28,6 +35,7 @@ def shipped(generation, unit, tmp_path):
     recipe, _, spec = unit
     descriptor = KernelDescriptor(recipe.kernel_id, "test.t13.matmul_probe", Backend.ASCENDC,
         compile_mode=CompileMode.AOT, source=recipe.source, target_soc=recipe.target_soc,
+        tiling_schema_version=recipe.tiling_schema_version,
         launch_abi=KernelLaunchABI(recipe.launch_abi, recipe.host_entry,
                                   ("workspace", "workspace_bytes", "executor", "stream")))
     store, record, paths = generation
@@ -182,51 +190,7 @@ def test_verified_manifest_with_missing_aclnn_symbol_is_load_error(shipped, unit
     assert isinstance(caught.value.__cause__, discovery.OpPackageSymbolError)
 
 
-import ctypes as C
-import errno
-import os
-from types import SimpleNamespace
-
-
-from flashinfer.jit import op_package as package
-from tests.packaging.test_ascendc_op_package import generation, unit
-
-
-@pytest.fixture
-def isolated_runtime(monkeypatch, unit):
-    recipe, _, _ = unit
-    calls = []
-
-    def workspace(*args):
-        return 0
-
-    def launch(*args):
-        return 0
-
-    api = SimpleNamespace(**{recipe.host_entry: launch,
-                            recipe.host_entry + "GetWorkspaceSize": workspace})
-
-    def cdll(path, mode):
-        calls.append(Path(path))
-        return api
-
-    monkeypatch.setattr(C, "CDLL", cdll)
-    monkeypatch.setattr(package, "_active_package", None)
-    # Track an initially absent key before the loader mutates os.environ.
-    monkeypatch.setenv("ASCEND_CUSTOM_OPP_PATH", "")
-    monkeypatch.delenv("ASCEND_CUSTOM_OPP_PATH", raising=False)
-    try:
-        yield calls, api
-    finally:
-        active = package._active_package
-        package._active_package = None
-        if active is not None:
-            for _, module in active.values():
-                if module._registration_fd is not None:
-                    os.close(module._registration_fd)
-
-
-def test_dotted_store_uses_same_verified_directory_via_retained_fd(generation, isolated_runtime):
+def test_dotted_store_uses_same_verified_directory_via_retained_fd(generation, fake_runtime):
     store, record, paths = generation
     directory = store.directory(record)
     assert ".objects" in directory.parts
@@ -243,14 +207,14 @@ def test_dotted_store_uses_same_verified_directory_via_retained_fd(generation, i
     assert (registration / "op_api/lib/libcust_opapi.so").read_bytes() == (
         directory / paths["api"]).read_bytes()
     assert package.load_op_package(directory, target_soc=record.artifact.target_soc) is module
-    assert len(isolated_runtime[0]) == 1
+    assert len(fake_runtime) == 1
     assert os.fstat(module._registration_fd).st_ino == verified.st_ino
 
 
 @pytest.mark.parametrize("failure", ["dlopen", "symbol"])
 @pytest.mark.parametrize("previous", [None, "/prior/vendor"])
 def test_failed_activation_closes_alias_fd_and_restores_environment(
-    generation, isolated_runtime, monkeypatch, failure, previous,
+    unit, generation, fake_runtime, monkeypatch, failure, previous,
 ):
     store, record, _ = generation
     if previous is not None:
@@ -267,7 +231,7 @@ def test_failed_activation_closes_alias_fd_and_restores_environment(
         captured.append(fd)
         if failure == "dlopen":
             raise original
-        return SimpleNamespace()
+        return SimpleNamespace(fi_aclnn_binding_fingerprint=lambda: unit[0].fingerprint.encode())
 
     monkeypatch.setattr(C, "CDLL", cdll)
     error = OSError if failure == "dlopen" else AttributeError
@@ -284,7 +248,7 @@ def test_failed_activation_closes_alias_fd_and_restores_environment(
 
 
 def test_release_without_dots_keeps_original_registration_path(
-    generation, isolated_runtime, tmp_path,
+    generation, fake_runtime, tmp_path,
 ):
     store, record, _ = generation
     release = export_op_package(store.directory(record), tmp_path / "release")
@@ -293,13 +257,6 @@ def test_release_without_dots_keeps_original_registration_path(
     assert module.registration_path == module.vendor_path
     assert module._registration_fd is None
     assert os.environ["ASCEND_CUSTOM_OPP_PATH"] == str(module.vendor_path)
-
-
-import json
-
-
-from flashinfer.jit.cache import verify_build_directory
-from flashinfer.runtime import SchemaError
 
 
 @pytest.mark.parametrize("damage", ["digest", "size", "missing", "extra"])

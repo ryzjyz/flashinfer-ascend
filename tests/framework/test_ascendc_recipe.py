@@ -1,7 +1,4 @@
-"""T13-I host contracts and failures; real A5 execution is in the example.
-
-These tests need neither the CANN compiler nor initialized CATLASS headers.
-"""
+"""Source, dependency and cache identity of the public ACLNN build recipes."""
 
 from dataclasses import replace
 import hashlib
@@ -16,22 +13,19 @@ from flashinfer.jit import (
     DiskJitBuildStore, JitCompilationError, JitSpecRegistry, declare_kernel,
 
 )
-from flashinfer.jit._legacy_recipe import (
-    _LegacyBuildDependency as BuildDependency,
-    _LEGACY_CATLASS_REVISION as CATLASS_REVISION,
-)
+from flashinfer.jit.recipe import BuildDependency, CATLASS_REVISION
+from flashinfer.jit import BuildRecipe, AscendCBuildConfig, load_build_recipes, resolve_build_recipe
 from flashinfer.runtime import (
     Backend, CompileMode, KernelDescriptor, KernelLaunchABI, KernelRegistry, SchemaError,
 )
-from tests.support.legacy_ascendc import ROOT, BuildRecipe, AscendCBuildConfig, load_build_recipes, export_op_package, resolve_build_recipe
 
-
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
 def recipes():
     return tuple(r for r in load_build_recipes(ROOT / "csrc/recipes/matmul_probe.json")
-                 if r.output_kind == "host_shared")
+                 if r.target_soc == "Ascend950")
 
 
 def toolchain():
@@ -43,14 +37,15 @@ def toolchain():
 def descriptor(recipe):
     return KernelDescriptor(recipe.kernel_id, "test.t13.matmul_probe", Backend.ASCENDC,
         compile_mode=CompileMode.JIT, target_soc=recipe.target_soc, source=recipe.source,
-        launch_abi=KernelLaunchABI(recipe.launch_abi, recipe.host_entry, ("stream", "a", "b", "c")))
+        tiling_schema_version=recipe.tiling_schema_version,
+        launch_abi=KernelLaunchABI(recipe.launch_abi, recipe.host_entry, ("workspace", "workspace_bytes", "executor", "stream")))
 
 
 def declare(resolved, **kwargs):
     d = descriptor(resolved.recipe)
     backend = AscendCBackend(recipes=(resolved,), toolchain=toolchain())
     values = dict(backend=backend, registry=KernelRegistry((d,)), spec_registry=JitSpecRegistry(),
-                  output_path="probe/kernel.so", entry_point=resolved.recipe.host_entry,
+                  output_path="op-package.json", entry_point=resolved.recipe.host_entry,
                   environment_fingerprint=toolchain().fingerprint, specialization_fingerprint="a" * 64)
     values.update(kwargs)
     return backend, declare_kernel(d.kernel_id, **values)
@@ -61,7 +56,7 @@ def test_manifest_source_closure_and_configuration_switch_are_explicit(recipes):
     for recipe in recipes:
         assert BuildRecipe.from_dict(json.loads(json.dumps(recipe.to_dict()))) == recipe
         assert recipe.source.language == "ascendc"
-        assert recipe.output_kind == "host_shared"
+        assert recipe.output_kind == "op_package"
         for ref in recipe.sources + recipe.headers:
             assert hashlib.sha256((ROOT / ref.locator).read_bytes()).hexdigest() == ref.digest
     assert native.dependencies == ()
@@ -134,9 +129,9 @@ def test_actual_dependency_content_changes_only_dependent_cache_identity(recipes
 
 
 @pytest.mark.parametrize("change", [
-    dict(output_kind="op_package"), dict(implementation="catlass"),
-    dict(tiling_mode="gm_buffer"), dict(workspace_bytes=8), dict(task_type="mixed"),
-    dict(device_entry="bad entry"), dict(definitions=("FI_HOST_ENTRY=other",)),
+    dict(output_kind="host_shared"), dict(tiling_schema_version=1),
+    dict(tiling_mode="gm_buffer"), dict(workspace_bytes=-1), dict(task_type="mixed"),
+    dict(device_entry="bad entry"), dict(host_entry="wrong"),
 ])
 def test_unimplemented_or_incoherent_recipe_protocols_fail_closed(recipes, change):
     with pytest.raises(SchemaError):
@@ -149,7 +144,7 @@ def test_recipe_and_descriptor_cannot_diverge(recipes):
     for changed in (replace(d, target_soc="Ascend910B"),
                     replace(d, source=replace(d.source, digest="b" * 64)),
                     replace(d, launch_abi=replace(d.launch_abi, abi_name="other")),
-                    replace(d, tiling_schema_version=2)):
+                    replace(d, tiling_schema_version=3)):
         with pytest.raises(SchemaError, match="does not bind"):
             recipe.validate_descriptor(changed)
 
@@ -186,7 +181,7 @@ def test_modified_source_is_rejected_before_any_compiler_runs(recipes, tmp_path,
         backend.compile(spec, build_directory=tmp_path / "staging")
     assert caught.value.log_path.is_file()
     assert not (tmp_path / "staging/ascendc-build").exists()
-    assert not (tmp_path / "staging/probe/kernel.so").exists()
+    assert not (tmp_path / "staging/op-package.json").exists()
 
 
 def test_no_cann_discovery_has_an_explicit_failure(monkeypatch):

@@ -6,7 +6,8 @@ this standalone eager package does not claim that framework integration.
 """
 
 from ..runtime import build_signature, current_hardware, dispatch
-from ..runtime.runner import run_selected as _run_selected
+from ..runtime.runner import resolve_operator_runner, run_selected as _run_selected
+from ..runtime.signature import with_nd_output
 
 
 def single_prefill_with_kv_cache_catlass(
@@ -52,16 +53,19 @@ def _single_prefill_impl(
     signature, output_metadata = prefill_signature(
         q, k, v, causal=causal, kv_layout=kv_layout, custom_mask=custom_mask, out=out,
     )
-    decision = dispatch(signature, current_hardware(), backend=backend, kernel_id=kernel_id)
+    _, runner = resolve_operator_runner(
+        signature.op, (q, k, v, out, causal, kv_layout, custom_mask), None, signature,
+        hardware=current_hardware(), backend=backend, kernel_id=kernel_id, select=dispatch,
+        fallback=_run_selected,
+    )
     if out is None:
         out = torch.empty(output_metadata.shape, dtype=output_metadata.dtype, device=q.device)
-    _run_selected(decision.kernel_id, q, k, v, out)
+    runner(q, k, v, out)
     return out
 
 
 def prefill_signature(q, k, v, *, causal=False, kv_layout="NHD", custom_mask=None, out=None):
     """Build the identical validated workload for dispatch and offline tuning."""
-    from dataclasses import replace
     from types import SimpleNamespace
     from ..operators.attention.single_prefill_catlass.operator import metadata_reason
 
@@ -91,16 +95,7 @@ def prefill_signature(q, k, v, *, causal=False, kv_layout="NHD", custom_mask=Non
                          **({"tensor_contiguity": "0"} if any(not t.is_contiguous() for t in tensors) else {})},
     )
     if out is None:
-        signature = replace(
-            signature, dtypes=signature.dtypes + (str(output_metadata.dtype).removeprefix("torch."),),
-            shapes=signature.shapes + (output_metadata.shape,),
-            layouts=signature.layouts + ("",),
-            physical_layouts=tuple(
-                signature.physical_layouts[index]
-                if index < len(signature.physical_layouts) else ""
-                for index in range(3)
-            ) + ("ND",),
-        )
+        signature = with_nd_output(signature, signature.dtypes[0], output_metadata.shape)
     return signature, output_metadata
 
 

@@ -16,7 +16,7 @@
 
 recipe 和 spec 不替代 capability；编译通过不扩大硬件支持。修改源码、头文件、CMake、能力或 ABI 后重新生成、冻结并构建，不手填 SHA 或改 manifest 消除失配。
 
-设备源码直接声明算子自己的具名入口，例如 `fi_matmul`、`fi_flash_attention`。v2 构建核对 `device_entry` 与 OpDef 生成的 `opInterface.value`，保留源码函数名进行编译；不注入 `FI_DEVICE_ENTRY` 重命名宏。旧 v1 冻结兼容样例保留其原始宏 ABI。
+设备源码直接声明算子自己的具名入口，例如 `fi_matmul`、`fi_flash_attention`。v2 构建核对 `device_entry` 与 OpDef 生成的 `opInterface.value`，保留源码函数名进行编译；不注入 `FI_DEVICE_ENTRY` 重命名宏。
 
 ## 源码与包内资源
 
@@ -50,21 +50,23 @@ python -B -m flashinfer.aot --freeze --all
 python -B -m flashinfer.aot --all --cache-dir build/aot-cache --output-dir build/aot-release
 ```
 
+全包构建默认每两个可用 CPU 分配一个包编译任务，最多同时编译 8 个包，每个包内 CMake 使用 `-j2`。`--jobs N` 可指定并行包数，`--jobs 1` 可串行构建。发布清单保持登记顺序。
+
 冻结与构建核验依赖根、固定 revision、头文件及环境身份。CATLASS 根通过 `FLASHINFER_CATLASS_ROOT` 或 AOT 的 `--dependency-root catlass=...` 指定；wheel 不携带完整 CATLASS 头树。通用动态依赖根为 `FLASHINFER_<NAME>_ROOT`。
 
 CATLASS 固定为 [v2.2.0](https://gitcode.com/cann/catlass/tree/v2.2.0)，commit `6c0a3242b2effd861ac91aab1999f2226b643614`。A2/A3 共用 arch22，与 A5/arch35 使用独立设备实现、Descriptor 和产物，公共 prefill 接口和 runner 相同；A3 真机数值未验证。编译与数值测试定义见 [多目标验收](../tests/packaging/test_catlass_targets_real.py)。交叉编译不等于目标设备运行通过。
 
 ## 原生产物与执行
 
-公开原生构建采用 `schema_version=2`、`op_package`。包包含 ACLNN host API、推形/tiling 库、设备二进制和元数据。旧 v1/raw/host_shared 仅用于内部冻结兼容测试，不是新算子接入路径。
+公开原生构建采用 `schema_version=2`、`op_package`。包包含 ACLNN host API、推形/tiling 库、设备二进制和元数据。公开配置和发布入口拒绝旧 v1/raw/host_shared 格式。
 
-每次新构建强制将 NativeBinding 与该算子 OpDef 生成的 ACLNN 头逐参数核对，生成并编译 `fi_aclnn_adapter.cpp`；参数名、顺序或类型失配直接终止构建。导出保留适配源码、头和身份元数据，加载核验其摘要及库内 recipe 指纹；新发布包必须包含该适配。它是框架生成物，作者不逐算子手写。公共调用自动执行延迟 Torch 注册。
+构建时，框架将 `NativeBinding` 与 OpDef 生成的 ACLNN 头逐参数核对，参数名、顺序或类型失配会终止构建。`fi_aclnn_adapter.cpp` 在 vendor 库中导出 recipe 指纹。框架另行生成 `fi_aclnn_submit.cpp`，通过公共头 `csrc/aclnn_torch_adapter/aclnn_adapter.h` 调用 `EXEC_NPU_CMD`，将编译产物 `fi_aclnn_submit.so` 随算子包交付。首次调用校验并绑定这两个库，算子作者只需维护原有声明。
 
 `AotKernelRunner` 优先搜索并验证匹配 AOT，再通过 runner 工厂绑定 Tensor 调用。只有 missing 且实现允许回落、全局策略也允许时才 JIT；corrupt、加载失败和身份冲突不触发重编。所有候选不兼容可能汇总为 missing，之后仍遵守该策略。
 
-原生 runner 复用 TorchNPU/ACLNN 桥：Tensor/属性描述 → GetWorkspaceSize 与 host tiling → workspace/executor → 当前 stream 提交。后端只适配真实 ABI，不悄悄复制输入或替换用户 out。接口的同步、资源与图限制按具体 runner 核对。
+原生 runner 通过 `torch.ops.flashinfer_aclnn._execute` 进入 C++。调用线程按签名转换 Tensor、列表与属性，执行 `GetWorkspaceSize` 取得 executor，再分配工作区。第二阶段由 TorchNPU 的 `OpCommand` 提交到调用时的当前 NPU 流。回调持有下发所需的参数和工作区，调用方可以继续使用自己的 `out`。
 
-首次激活前可准备互不冲突的可信包集合并同进程使用；同名 generation 热替换或激活后追加 vendor 仍要求新进程。缓存字节替换不会改变已经绑定的 runner。
+首次激活前可准备互不冲突的可信包集合并同进程使用。若进程已设置 `ASCEND_CUSTOM_OPP_PATH`，应在第一个原生 Torch 运算前将所需 vendor 一起加入。CANN 会缓存该集合，之后追加的 vendor 可能在 `GetWorkspaceSize` 报 561002、找不到 tiling。同名 generation 热替换或激活后追加 vendor 需要新进程。缓存字节替换不会改变已经绑定的 runner。
 
 ## Triton 与 CANN
 
@@ -81,7 +83,7 @@ python -B -m flashinfer.aclnn.build --output-dir build/aclnn
 export FLASHINFER_ACLNN_ADAPTER_PATH="$PWD/build/aclnn"
 ```
 
-桥需要匹配的 Torch/TorchNPU/CANN 头与库、C++17 编译器和 libffi。它与设备编译是不同构建单元；设备参数不应直接冒充 host 编译选项。
+桥需要匹配的 Torch/TorchNPU/CANN 头与库以及 C++17 编译器。它与设备编译是不同构建单元；设备参数不应直接冒充 host 编译选项。
 
 | 构建模式 | 实际行为 |
 | --- | --- |

@@ -16,6 +16,33 @@ from flashinfer.operators.testing import (
 from flashinfer.runtime import Backend, CompileMode, KernelRegistry, get_global_registry, kernel_registry_scope
 
 
+@pytest.mark.real_compile
+@pytest.mark.requires_soc("Ascend910B", "Ascend910C", "Ascend950")
+def test_signature_reads_current_storage_formats(npu_runtime, aot_runtime, monkeypatch):
+    from unittest.mock import Mock
+    from flashinfer.aclnn._native import load_adapter
+    from flashinfer.runtime import signature
+
+    torch, torch_npu = npu_runtime
+    load_adapter()
+    assert signature._batch_format_query == (torch, torch.ops.flashinfer_aclnn._storage_formats.default)
+    formats = Mock(wraps=signature._batch_format_query[1])
+    monkeypatch.setattr(signature, "_batch_format_query", (torch, formats))
+    x = torch.empty((32, 32), dtype=torch.float16, device="npu")
+    weight = torch.nn.Parameter(torch.empty_like(x), requires_grad=False)
+    operands = (x, weight)
+    before = signature.build_signature("probe", operands)
+    formats.assert_called_once_with(operands)
+    torch_npu.npu_format_cast_(x, 29)
+    after = signature.build_signature("probe", operands)
+    assert formats.call_count == 2
+    assert before.shapes == after.shapes and before.dtypes == after.dtypes
+    assert before.physical_layouts == ("ND", "ND")
+    assert after.physical_layouts == ("NZ", "ND")
+    assert signature.build_signature("probe", (x, None, weight)).physical_layouts == ("NZ", "", "ND")
+    assert formats.call_count == 2
+
+
 def _public_cases():
     for param in aot_params():
         impl, = param.values

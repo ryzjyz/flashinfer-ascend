@@ -7,6 +7,7 @@ No device initialization or .run installation is performed here.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import hashlib
 import json
@@ -68,11 +69,6 @@ def _for_target(recipe, target):
 
 
 def export_op_package(directory, output_dir):
-    """Export only the public v2 operator contract into new distributions."""
-    return _export_op_package(directory, output_dir, allow_legacy=False)
-
-
-def _export_op_package(directory, output_dir, *, allow_legacy):
     """Copy the exact verified store generation into a read-only release layout.
 
     Release copies are distribution artifacts, never another build cache. Keep
@@ -85,11 +81,11 @@ def _export_op_package(directory, output_dir, *, allow_legacy):
 
     spec = JitSpec.from_dict(data["spec"])
     package, recipe = verify_op_package(directory, spec)
-    if recipe.schema_version != 2 and not allow_legacy:
+    if recipe.schema_version != 2:
         raise SchemaError(
             "new releases require a v2 recipe; legacy v1 artifacts are read-only compatibility"
         )
-    if recipe.schema_version == 2 and package["schema_version"] != 2 and not allow_legacy:
+    if package["schema_version"] != 2:
         raise SchemaError("new releases require a matching generated ACLNN adapter; rebuild the package")
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / spec.fingerprint
@@ -136,9 +132,15 @@ def _dependency_overrides(dependency_roots=None, catlass_root=None):
     return roots
 
 
-def _publish(recipe, spec, backend, store, output_dir):
+def _build_package(unit, store):
+    _, spec, backend = unit
     hit = store.lookup(spec) is not None
     record = _build_record(spec, backend=backend, store=store)
+    return record, hit
+
+
+def _publish(recipe, spec, build, store, output_dir):
+    record, hit = build
     output = export_op_package(store.directory(record), output_dir)
     size = sum(p.stat().st_size for p in output.rglob("*") if p.is_file())
     print(
@@ -161,6 +163,27 @@ def _publish(recipe, spec, backend, store, output_dir):
     return output
 
 
+def _build_packages(units, store, output_dir, jobs):
+    if jobs is None:
+        cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+        # Each package already runs CMake with two build jobs.
+        jobs = min(8, max(1, cpus // 2))
+    if type(jobs) is not int or jobs < 1:
+        raise SchemaError("AOT jobs must be a positive integer")
+
+    def compile_one(unit):
+        return _build_package(unit, store)
+
+    def publish_in_order(builds):
+        return tuple(_publish(recipe, spec, build, store, output_dir)
+                     for (recipe, spec, _), build in zip(units, builds))
+
+    if jobs == 1 or len(units) == 1:
+        return publish_in_order(map(compile_one, units))
+    with ThreadPoolExecutor(max_workers=min(jobs, len(units))) as pool:
+        return publish_in_order(pool.map(compile_one, units))
+
+
 def build_production_packages(
     *,
     output_dir,
@@ -170,7 +193,8 @@ def build_production_packages(
     cann_root=None,
     catlass_root=None,
     kernel_ids=(),
-    dependency_roots=None
+    dependency_roots=None,
+    jobs=None,
 ):
     """Build every registered production AOT entry using its frozen identity.
 
@@ -233,10 +257,7 @@ def build_production_packages(
         backend = AscendCBackend(recipes=(resolved,), toolchain=toolchain)
         prepared.append((recipe, spec, backend))
     # A later invalid source/spec must fail before compiling an earlier kernel.
-    outputs = [
-        _publish(recipe, spec, backend, store, output_dir)
-        for recipe, spec, backend in prepared
-    ]
+    outputs = _build_packages(prepared, store, output_dir, jobs)
     print(
         json.dumps(
             dict(
@@ -248,7 +269,7 @@ def build_production_packages(
         ),
         flush=True,
     )
-    return tuple(outputs)
+    return outputs
 
 
 def compile_and_package(
@@ -261,7 +282,8 @@ def compile_and_package(
     cann_root=None,
     catlass_root=None,
     recipe_id=None,
-    dependency_roots=None
+    dependency_roots=None,
+    jobs=None,
 ):
     """Build a selected recipe, or all frozen production entries.
 
@@ -288,6 +310,7 @@ def compile_and_package(
             cann_root=cann_root,
             catlass_root=catlass_root,
             dependency_roots=dependency_roots,
+            jobs=jobs,
         )
     root = Path(source_root) if source_root else _source_root()
     from flashinfer._resources import recipe_root
@@ -337,10 +360,11 @@ def compile_and_package(
             catlass_root=catlass_root,
             kernel_ids=(template.kernel_id,),
             dependency_roots=dependency_roots,
+            jobs=jobs,
         )
     toolchain = AscendCToolchain.discover(cann_root)
     store = DiskJitBuildStore(cache_dir)
-    outputs = []
+    prepared = []
     for recipe in recipes:
         resolved = resolve_build_recipe(
             recipe,
@@ -381,8 +405,8 @@ def compile_and_package(
                 else recipe.fingerprint
             ),
         )
-        outputs.append(_publish(recipe, spec, backend, store, output_dir))
-    return tuple(outputs)
+        prepared.append((recipe, spec, backend))
+    return _build_packages(prepared, store, output_dir, jobs)
 
 
 def main():
@@ -412,6 +436,7 @@ def main():
     parser.add_argument("--soc", action="append", dest="targets", default=[])
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--jobs", type=int, help="maximum concurrent package builds (default: up to 8, two CPUs per package)")
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--cann-root", type=Path)
     parser.add_argument("--catlass-root", type=Path)
@@ -423,6 +448,8 @@ def main():
         help="locate any recipe dependency; repeat for multiple dependencies",
     )
     args = vars(parser.parse_args())
+    if args["jobs"] is not None and args["jobs"] < 1:
+        parser.error("--jobs must be a positive integer")
     all_production = args.pop("all")
     freeze = args.pop("freeze")
     kernel_ids = args.pop("kernel_ids")

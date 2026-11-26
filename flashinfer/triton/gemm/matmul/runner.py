@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from threading import RLock
 from flashinfer._matmul import TRITON_KERNEL_ID, validate_tensors
+from flashinfer.jit._triton_abi import record_tensor_streams, task_queue_enabled
 from flashinfer.runtime import (
     Backend,
     CompileMode,
@@ -26,8 +27,11 @@ class TritonMatmulRunner:
         self.build_requests = 0
         self.launches = 0
 
-    @lru_cache(maxsize=1)
     def spec(self):
+        return self._spec(task_queue_enabled())
+
+    @lru_cache(maxsize=2)
+    def _spec(self, queued):
         from flashinfer.jit import JitEnvironment, TritonBackend
 
         environment = runtime_identity()
@@ -44,6 +48,7 @@ class TritonMatmulRunner:
         )
         return TritonBackend().declare(
             self.descriptor,
+            task_queue=queued,
             target_soc="Ascend950",
             output_path="matmul/kernel.bin",
             entry_point="_matmul_kernel",
@@ -59,11 +64,14 @@ class TritonMatmulRunner:
             ),
         )
 
-    @lru_cache(maxsize=1)
     def tuning_identity(self, signature, hardware):
+        return self._execution_identity(task_queue_enabled())
+
+    @lru_cache(maxsize=2)
+    def _execution_identity(self, queued):
         return fingerprint(
             dict(
-                spec=self.spec().fingerprint,
+                spec=self._spec(queued).fingerprint,
                 runtime=runtime_identity(),
                 runner=execution_sources(
                     (
@@ -78,10 +86,15 @@ class TritonMatmulRunner:
         )
 
     def prepare(self, device_index):
+        queued = task_queue_enabled()
+        key = (device_index, queued)
+        module = self._modules.get(key)
+        if module is not None:
+            return module
         from flashinfer.jit import TritonBackend, build_and_load
 
         with self._lock:
-            if device_index not in self._modules:
+            if key not in self._modules:
                 source = (
                     Path(__file__).resolve().parents[3] / self.descriptor.source.locator
                 )
@@ -92,30 +105,29 @@ class TritonMatmulRunner:
                     raise SchemaError(
                         "Triton Matmul SourceRef digest mismatch; refresh the declaration"
                     )
-                self._modules[device_index] = build_and_load(
-                    self.spec(), backend=TritonBackend()
+                self._modules[key] = build_and_load(
+                    self._spec(queued), backend=TritonBackend()
                 )
                 self.build_requests += 1
-            return self._modules[device_index]
+            return self._modules[key]
 
     def __call__(self, a, b, out):
         import torch
 
         validate_tensors(a, b, out)
-        with torch.npu.device(a.device):
-            module = self.prepare(torch.npu.current_device())
-            stream = torch.npu.current_stream(a.device)
-            # Drain TorchNPU's host queue before submitting directly to its stream.
-            stream.synchronize()
-            for tensor in (a, b, out):
-                tensor.record_stream(stream)
-            m, k = a.shape
-            n = b.shape[1]
-            try:
-                block_m, block_n = _CONSTANTS["BLOCK_M"], _CONSTANTS["BLOCK_N"]
-                module.opaque_module[
-                    ((m + block_m - 1) // block_m, (n + block_n - 1) // block_n)
-                ](a, b, out, m, n, k, stream=stream.npu_stream)
-                self.launches += 1
-            finally:
-                stream.synchronize()
+        device = a.device.index
+        if device != torch.npu.current_device():
+            with torch.npu.device(device):
+                return self._launch(a, b, out, device)
+        return self._launch(a, b, out, device)
+
+    def _launch(self, a, b, out, device):
+        module = self.prepare(device)
+        record_tensor_streams((a, b, out))
+        m, k = a.shape
+        n = b.shape[1]
+        block_m, block_n = _CONSTANTS["BLOCK_M"], _CONSTANTS["BLOCK_N"]
+        module.opaque_module[
+            ((m + block_m - 1) // block_m, (n + block_n - 1) // block_n)
+        ](a, b, out, m, n, k)
+        self.launches += 1

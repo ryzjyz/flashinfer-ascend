@@ -85,6 +85,7 @@ _BACKEND_GROUPS = {
     Backend.CANN: "cann",
     Backend.ASCENDC: None,
     Backend.TRITON: None,
+    Backend.CATLASS_DSL: None,
     Backend.EXTERNAL: "external",
     Backend.CUSTOM: None,
     Backend.REFERENCE: "reference",
@@ -97,6 +98,7 @@ _COMPILE_GROUPS = {
     CompileMode.JIT: "jit",
     CompileMode.NONE: "jit",
 }
+_POLICIES = {"auto": "auto", **{backend.value: backend for backend in Backend}}
 
 
 def _heuristic_group(descriptor: KernelDescriptor) -> str:
@@ -124,7 +126,81 @@ def _sort_key(descriptor: KernelDescriptor, order: Optional[Tuple[str, ...]] = N
 _decision_cache: WeakKeyDictionary[
     KernelRegistry, Dict[tuple, DispatchDecision]
 ] = WeakKeyDictionary()
+_MAX_RUNNER_PROFILES = 64
 _cache_lock = threading.Lock()
+
+
+def _backend_policy(backend):
+    if backend is None:
+        backend = config.default_backend()
+    try:
+        return _POLICIES[backend]
+    except (KeyError, TypeError) as error:
+        supported = ", ".join(("auto", *sorted(item.value for item in Backend)))
+        cuda_backends = {"fa2", "fa3", "cudnn", "trtllm-gen", "cutlass", "cute-dsl", "cutile"}
+        hint = (
+            "这是 CUDA 专有后端；昇腾请使用 backend='auto' 或 backend='cann'。"
+            if isinstance(backend, str) and backend in cuda_backends
+            else "请使用本仓已登记的 backend 名称。"
+        )
+        raise DispatchError(
+            f"不支持的 backend {backend!r}。{hint}支持的 backend 值：{supported}"
+        ) from error
+
+
+def _selection_context(hardware, policy, kernel_id, allow_reference, registry, order):
+    return (hardware, policy, kernel_id, allow_reference, config.allow_custom_kernels(),
+            config.jit_disabled(), order, registry.revision, tuning_cache_token())
+
+
+def _operator_context(registry, selector, hardware):
+    op, backend, kernel_id = selector
+    if op is None:
+        # A caller of run_selected already fixed the kernel, without a routing policy.
+        return hardware, registry.revision
+    return _selection_context(hardware, _backend_policy(backend), kernel_id, False,
+                              registry, config.dispatch_order())
+
+
+def operator_runner_profiles(registry, selector, hardware):
+    """Return admitted profiles only while the dispatch policy that selected them is active."""
+    group = registry._operator_runner_profiles.get(selector)
+    if group is None or config.dispatch_cache_disabled():
+        return None
+    selected_context, profiles = group
+    return profiles if _operator_context(registry, selector, hardware) == selected_context else None
+
+
+def _put_bounded(entries, key, value):
+    if len(entries) >= _MAX_RUNNER_PROFILES and key not in entries:
+        del entries[next(iter(entries))]
+    entries[key] = value
+
+
+def admit_operator_profile(registry, selector, hardware, signature, decision):
+    """Get the active cache after selection, or for an already fixed runner identity."""
+    if config.dispatch_cache_disabled():
+        return None
+    context = _operator_context(registry, selector, hardware)
+    with _cache_lock:
+        if decision is not None:
+            recorded = _decision_cache.get(registry, {}).get((signature, context))
+            if recorded is None or recorded.kernel_id != decision.kernel_id:
+                return None
+        else:
+            # An explicit run_selected() also participates in clear_dispatch_cache().
+            _decision_cache.setdefault(registry, {})
+        groups = registry._operator_runner_profiles
+        group = groups.get(selector)
+        if group is None or group[0] != context:
+            group = (context, {})
+            _put_bounded(groups, selector, group)
+        return group[1]
+
+
+def remember_operator_runner(profiles, profile, runner):
+    with _cache_lock:
+        _put_bounded(profiles, profile, runner)
 
 
 def dispatch(
@@ -141,52 +217,25 @@ def dispatch(
     无可用 tuning 冠军时按 ``FLASHINFER_NPU_DISPATCH_ORDER`` 排序。
     """
     registry = registry or get_global_registry()
-    if backend is None:
-        backend = config.default_backend()
-    try:
-        policy: Union[str, Backend] = (
-            "auto" if backend == "auto" else Backend(backend)
-        )
-    except (ValueError, TypeError) as error:
-        supported = ", ".join(("auto", *sorted(item.value for item in Backend)))
-        cuda_backends = {"fa2", "fa3", "cudnn", "trtllm-gen", "cutlass", "cute-dsl", "cutile"}
-        hint = (
-            "这是 CUDA 专有后端；昇腾请使用 backend='auto' 或 backend='cann'。"
-            if isinstance(backend, str) and backend in cuda_backends
-            else "请使用本仓已登记的 backend 名称。"
-        )
-        raise DispatchError(
-            f"不支持的 backend {backend!r}。{hint}支持的 backend 值：{supported}"
-        ) from error
-
+    policy = _backend_policy(backend)
     # 每次读取并验证；快照同时用于缓存 key 与本次排序，避免配置串用。
     order = config.dispatch_order()
     cache_key = None
     if not config.dispatch_cache_disabled():
-        cache_key = (
-            signature,
-            hardware,
-            str(policy),
-            kernel_id,
-            allow_reference,
-            config.allow_custom_kernels(),
-            config.jit_disabled(),
-            order,
-            registry.revision,
-            tuning_cache_token(),
-        )
+        context = _selection_context(hardware, policy, kernel_id, allow_reference, registry, order)
+        cache_key = (signature, context)
         with _cache_lock:
             registry_cache = _decision_cache.get(registry)
             cached = registry_cache.get(cache_key) if registry_cache is not None else None
         if cached is not None:
-            return replace(cached, cache_hit=True)
+            return cached
 
     decision = _dispatch_uncached(
         signature, hardware, policy, kernel_id, allow_reference, registry, order
     )
     if cache_key is not None:
         with _cache_lock:
-            _decision_cache.setdefault(registry, {})[cache_key] = decision
+            _decision_cache.setdefault(registry, {})[cache_key] = replace(decision, cache_hit=True)
     return decision
 
 
@@ -516,4 +565,6 @@ def explain_dispatch(
 def clear_dispatch_cache() -> None:
     """清空所有 registry 的决策缓存。"""
     with _cache_lock:
+        for registry in _decision_cache:
+            registry._operator_runner_profiles.clear()
         _decision_cache.clear()

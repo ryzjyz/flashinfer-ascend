@@ -42,6 +42,7 @@ def _driver_identity():
     inputs = {name: root / name for name in ("ascendc.py", "op_package.py")}
     # package_target consumes this shared mapping during compilation and
     # verification. Changing it must invalidate the frozen compiler identity.
+    inputs["aclnn/build.py"] = root.parent / "aclnn/build.py"
     inputs["runtime/targets.py"] = root.parent / "runtime/targets.py"
     return _canonical_hash({name: _digest(path) for name, path in inputs.items()})
 
@@ -104,6 +105,8 @@ class AscendCToolchain:
         identity["cann"] = _cann_identity(root)
         identity["host_abi"] = _canonical_hash(dict(machine=platform.machine(),
             python_abi=sys.implementation.cache_tag, libc=platform.libc_ver()))
+        from flashinfer.aclnn.build import torch_abi
+        identity["torch_abi"] = _canonical_hash(torch_abi())
         identity["driver"] = _driver_identity()
         standard_includes = _host_standard_includes(host)
         identity["host_cxx_headers"] = _standard_headers_identity(standard_includes)
@@ -114,7 +117,10 @@ class AscendCToolchain:
         return _canonical_hash(dict(self.identity))
 
     def validate(self):
+        from flashinfer.aclnn.build import torch_abi
         identity = dict(self.identity)
+        if _canonical_hash(torch_abi()) != identity["torch_abi"]:
+            raise SchemaError("Torch/torch_npu ABI changed after resolution")
         for name, path in (("bisheng", self.compiler), ("cmake", self.cmake), ("host_cxx", self.host_compiler)):
             if _digest(path) != identity[name + "_binary"]:
                 raise SchemaError("Ascend C toolchain changed after resolution: " + name)
@@ -256,7 +262,7 @@ def compile_recipe(spec, resolved: ResolvedBuildRecipe, toolchain: AscendCToolch
         if recipe.output_kind == "op_package":
             from .op_package import collect_package
 
-            collect_package(spec, recipe, scratch / "cmake", directory)
+            collect_package(spec, recipe, scratch / "cmake", directory, source_root=inputs, toolchain=toolchain)
         # Keep a small auditable receipt. CMake trees can contain symlinks and
         # third-party headers; they are private scratch, never store payloads.
         stable_commands = []

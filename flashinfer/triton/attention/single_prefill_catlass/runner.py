@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import RLock
 
 from flashinfer.runtime import SchemaError
+from flashinfer.jit._triton_abi import record_tensor_streams, task_queue_enabled
 
 from flashinfer.tuning.identity import runtime_identity
 
@@ -34,19 +35,23 @@ class TritonFlashAttentionRunner:
         self.build_requests = 0
         self.launches = 0
 
-    @lru_cache(maxsize=2)
-    def _execution_identity(self, dtype):
+    @lru_cache(maxsize=4)
+    def _execution_identity(self, dtype, queued):
         from flashinfer.tuning.identity import execution_sources
 
-        return _digest(dict(spec=self.spec(dtype).fingerprint,
+        return _digest(dict(spec=self._spec(dtype, queued).fingerprint,
                             runner=execution_sources(("triton/attention/single_prefill_catlass/runner.py", "jit/_triton_compile.py",
                                                       "jit/_triton_abi.py", "jit/loading.py")),
                             runtime=runtime_identity()))
 
     def tuning_identity(self, signature, hardware):
-        return self._execution_identity(signature.dtypes[0])
+        return self._execution_identity(signature.dtypes[0], task_queue_enabled())
 
     def spec(self, dtype):
+        return self._spec(dtype, task_queue_enabled())
+
+    @lru_cache(maxsize=4)
+    def _spec(self, dtype, queued):
         from flashinfer.jit import JitEnvironment, TritonBackend
 
         if dtype not in {"float16", "bfloat16"}:
@@ -61,7 +66,7 @@ class TritonFlashAttentionRunner:
             environment["python_abi"],
         )
         return TritonBackend().declare(
-            self.descriptor, target_soc="Ascend950", output_path="attention/kernel.bin",
+            self.descriptor, task_queue=queued, target_soc="Ascend950", output_path="attention/kernel.bin",
             entry_point=_ENTRY, environment_fingerprint=build_environment.fingerprint,
             specialization_fingerprint=_digest(dict(dtype=dtype, constants=_CONSTANTS, options=_OPTIONS)),
             compile_options=("signature=" + json.dumps(signature, sort_keys=True),
@@ -73,14 +78,15 @@ class TritonFlashAttentionRunner:
     def prepare(self, dtype, device_index):
         from flashinfer.jit import TritonBackend, build_and_load
 
-        key = (dtype, device_index)
+        queued = task_queue_enabled()
+        key = (dtype, device_index, queued)
         with self._lock:
             if key not in self._modules:
                 root = Path(__file__).resolve().parents[3]
                 source = root / self.descriptor.source.locator
                 if hashlib.sha256(source.read_bytes()).hexdigest() != self.descriptor.source.digest:
                     raise SchemaError("Triton FA SourceRef digest mismatch; refresh the declaration")
-                spec = self.spec(dtype)
+                spec = self._spec(dtype, queued)
                 module = build_and_load(spec, backend=TritonBackend())
                 self._modules[key] = module
                 self._specs[key] = spec
@@ -114,16 +120,8 @@ class TritonFlashAttentionRunner:
             raise ValueError("Triton FA requires contiguous ND tensors")
         with torch.npu.device(q.device):
             module = self.prepare(str(q.dtype).removeprefix("torch."), torch.npu.current_device())
-            stream = torch.npu.current_stream(q.device)
-            # This public FA contract is synchronous eager. Drain prior TorchNPU
-            # host submissions before a direct Triton launch on the same stream.
-            stream.synchronize()
-            for tensor in tensors:
-                tensor.record_stream(stream)
+            record_tensor_streams(tensors)
             s, heads, _ = q.shape
-            try:
-                module.opaque_module[((s + _CONSTANTS["BLOCK_M"] - 1) // _CONSTANTS["BLOCK_M"], heads)](
-                    q, k, v, out, s, k.shape[0], heads, stream=stream.npu_stream)
-                self.launches += 1
-            finally:
-                stream.synchronize()
+            module.opaque_module[((s + _CONSTANTS["BLOCK_M"] - 1) // _CONSTANTS["BLOCK_M"], heads)](
+                q, k, v, out, s, k.shape[0], heads)
+            self.launches += 1

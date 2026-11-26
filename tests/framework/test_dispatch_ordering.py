@@ -80,6 +80,7 @@ def _registry(descriptors):
     (Backend.CANN, (1, 1, 1)),
     (Backend.ASCENDC, (2, 3, 3)),
     (Backend.TRITON, (2, 3, 3)),
+    (Backend.CATLASS_DSL, (2, 3, 3)),
     (Backend.EXTERNAL, (0, 0, 0)),
     (Backend.CUSTOM, (2, 3, 3)),
     (Backend.REFERENCE, (4, 4, 4)),

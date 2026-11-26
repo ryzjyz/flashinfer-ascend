@@ -1,7 +1,7 @@
 import math
 
 import pytest
-from tests.support.pytest_plugin import cann_a5_device as npu
+from tests.conftest import cann_a5_device as npu
 import torch
 
 import flashinfer

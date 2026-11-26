@@ -1,6 +1,8 @@
 """Common Matmul contract shared by every execution backend; import-safe."""
 
 from types import SimpleNamespace
+from functools import lru_cache
+from typing import NamedTuple
 
 
 OP = "gemm.matmul"
@@ -26,19 +28,27 @@ def output_metadata(a, b, out=None):
 
 
 def metadata_reason(a, b, out):
-    if len(a.shape) != 2 or len(b.shape) != 2 or len(out.shape) != 2:
+    a_shape, b_shape, out_shape = a.shape, b.shape, out.shape
+    if len(a_shape) != 2 or len(b_shape) != 2 or len(out_shape) != 2:
         return "Matmul requires rank-2 tensors"
-    if a.shape[1] != b.shape[0] or tuple(out.shape) != (a.shape[0], b.shape[1]):
+    m, k = a_shape
+    n = b_shape[1]
+    if k != b_shape[0] or tuple(out_shape) != (m, n):
         return "Matmul input/output dimensions are inconsistent"
-    if any(int(v) <= 0 for t in (a, b, out) for v in t.shape):
+    if min(m, n, k) <= 0:
         return "Matmul dimensions must be positive"
-    if any(t.dtype != a.dtype or t.device != a.device for t in (b, out)):
+    if a.dtype != b.dtype or a.dtype != out.dtype or a.device != b.device or a.device != out.device:
         return "Matmul tensors must share dtype and device"
     return "supported"
 
 
+class _ParameterRole(NamedTuple):
+    role: str
+
+
+@lru_cache(maxsize=8)
 def overlap_parameters(count=3):
-    return tuple(SimpleNamespace(role="output" if i == count - 1 else "input") for i in range(count))
+    return tuple(_ParameterRole("output" if i == count - 1 else "input") for i in range(count))
 
 
 def validate_tensors(a, b, out):

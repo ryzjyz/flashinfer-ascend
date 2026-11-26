@@ -76,11 +76,18 @@ def test_three_backends_seven_shapes_functional_out_and_same_buffers(warm_matmul
 @pytest.mark.real_compile
 def test_triton_cold_compile_and_compiler_free_process_disk_hit(tmp_path):
     cache = tmp_path / "cold-cache"
-    execute("cold_jit", tmp_path, cache=cache)
-    execute("cached_jit", tmp_path, cache=cache)
+    execute("cold_jit", tmp_path, cache=cache, TRITON_ENABLE_TASKQUEUE="1")
+    execute("cached_jit", tmp_path, cache=cache, TRITON_ENABLE_TASKQUEUE="1")
     logs = list((cache / "jit/.objects").glob("*/build.log"))
     assert len(logs) == 1
     assert "compiled triton/gemm/matmul_v1/Ascend950" in logs[0].read_text()
+    # The same disk cache must serve both launchers in fresh processes.
+    execute("cold_jit", tmp_path, cache=cache, TRITON_ENABLE_TASKQUEUE="0")
+    for policy in ("1", "0"):
+        execute("cached_jit", tmp_path, cache=cache, TRITON_ENABLE_TASKQUEUE=policy)
+    metadata = [json.loads(path.read_text()) for path in (cache / "jit" / ".objects").glob("*/triton.json")]
+    assert {item["task_queue"] for item in metadata} == {False, True}
+    assert len({item["spec_fingerprint"] for item in metadata}) == 2
 
 
 @pytest.mark.real_compile

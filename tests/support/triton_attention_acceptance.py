@@ -131,6 +131,7 @@ def run(mode, cache_only=False):
         assert runner.build_requests == before == 2
         if mode == "routing":
             check_automatic_routing(registry, runner)
+    torch.npu.current_stream().wait_stream(stream)
     for i, (observed, reference, atol, rtol) in enumerate(observations):
         actual = observed.cpu().double()
         torch.testing.assert_close(actual, reference.double(), atol=atol, rtol=rtol)

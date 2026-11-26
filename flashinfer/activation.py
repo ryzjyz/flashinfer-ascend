@@ -7,7 +7,7 @@ from typing import Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-from .runtime import build_signature, current_hardware, dispatch, get_global_registry
+from .runtime.runner import run_operator
 
 
 def _run(name, input, out, enable_pdl):
@@ -22,9 +22,9 @@ def _run(name, input, out, enable_pdl):
         out = torch.empty(expected, dtype=input.dtype, device=input.device)
     if out.shape != expected or out.dtype != input.dtype or out.device != input.device:
         raise ValueError("out must have the expected shape, dtype and device")
-    signature = build_signature("activation." + name, (input,), layouts=("ND",))
-    decision = dispatch(signature, current_hardware(), backend=None)
-    return get_global_registry().get(decision.kernel_id).runner(input, out)
+    return run_operator(
+        "activation." + name, (input,), (input, out), layouts=("ND",),
+    )
 
 
 def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None) -> torch.Tensor:

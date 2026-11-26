@@ -6,7 +6,9 @@ JIT cache key（§8.1）都以它为输入侧。
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
+import sys
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .schema import InferenceSpec
@@ -102,11 +104,13 @@ def tensor_spec(tensor: Any) -> Tuple[str, Tuple[int, ...]]:
     只依赖 ``.dtype`` / ``.shape`` 属性协议，不 import torch——
     host 单测（§14.1）可用轻量假对象。
     """
-    dtype = str(getattr(tensor, "dtype", "unknown"))
-    if dtype.startswith("torch."):
-        dtype = dtype[len("torch."):]
-    shape = tuple(int(d) for d in getattr(tensor, "shape", ()))
-    return dtype, shape
+    dtype = str(getattr(tensor, "dtype", "unknown")).removeprefix("torch.")
+    return dtype, tuple(map(int, getattr(tensor, "shape", ())))
+
+
+_NPU_LAYOUTS = {2: "ND", 29: "NZ"}
+# Installed only after the optional native adapter has been verified and loaded.
+_batch_format_query = None
 
 
 def _tensor_physical_layout(tensor: Any) -> str:
@@ -120,11 +124,47 @@ def _tensor_physical_layout(tensor: Any) -> str:
     ):
         return ""
     try:
-        import torch_npu
-
-        return {2: "ND", 29: "NZ"}.get(torch_npu.get_npu_format(tensor), "")
+        module = sys.modules.get("torch_npu")
+        if module is None:
+            import torch_npu as module
+        return _NPU_LAYOUTS.get(module.get_npu_format(tensor), "")
     except Exception:
         return ""
+
+
+def _physical_layouts(tensors):
+    if _batch_format_query is not None and tensors:
+        torch, query = _batch_format_query
+        plain_types = (torch.Tensor, torch.nn.Parameter)
+        if (all(type(t) in plain_types for t in tensors)
+                and tensors[0].device.type in ("npu", "privateuseone")
+                and not torch.overrides.has_torch_function(tensors)
+                and not torch.utils._python_dispatch.is_in_torch_dispatch_mode()):
+            try:
+                return tuple(_NPU_LAYOUTS.get(code, "") for code in query(tensors))
+            except RuntimeError:
+                # Preserve per-operand unknown formats if one query fails.
+                pass
+    return tuple(map(_tensor_physical_layout, tensors))
+
+
+@lru_cache(maxsize=512)
+def _tensor_signature(op, specs, layouts, physical_layouts, specializations):
+    return InputSignature(
+        op=op, dtypes=tuple(dtype for dtype, _ in specs),
+        shapes=tuple(shape for _, shape in specs), layouts=layouts,
+        physical_layouts=physical_layouts, specializations=specializations,
+    )
+
+
+@lru_cache(maxsize=512)
+def with_nd_output(signature, dtype, shape):
+    """Include a prospective contiguous output in dispatch before allocating it."""
+    count = len(signature.dtypes)
+    physical = (signature.physical_layouts + ("",) * count)[:count]
+    return replace(signature, dtypes=signature.dtypes + (dtype,),
+                   shapes=signature.shapes + (shape,), layouts=signature.layouts + ("",),
+                   physical_layouts=physical + ("ND",))
 
 
 def build_signature(
@@ -141,18 +181,20 @@ def build_signature(
     inference 由公共语义入口显式构造，不能仅根据 Tensor dtype 推测量化方式。
     """
     tensors = tuple(tensors)
-    specs = [tensor_spec(t) for t in tensors]
-    layout_tuple = tuple(layouts) if layouts is not None else ("",) * len(tensors)
+    specs = tuple(map(tensor_spec, tensors))
+    layout_tuple = tuple(str(v) for v in layouts) if layouts is not None else ("",) * len(tensors)
     if len(layout_tuple) != len(tensors):
         raise ValueError("layouts 数量与张量数量不一致")
+    physical = _physical_layouts(tensors)
+    options = tuple(sorted((str(k), str(v)) for k, v in specializations.items())) if specializations else ()
+    if inference is None:
+        return _tensor_signature(op, specs, layout_tuple, physical, options)
     return InputSignature(
         op=op,
         dtypes=tuple(s[0] for s in specs),
         shapes=tuple(s[1] for s in specs),
         layouts=layout_tuple,
-        physical_layouts=tuple(_tensor_physical_layout(t) for t in tensors),
-        specializations=tuple(
-            sorted((str(k), str(v)) for k, v in (specializations or {}).items())
-        ),
+        physical_layouts=physical,
+        specializations=options,
         inference=inference,
     )

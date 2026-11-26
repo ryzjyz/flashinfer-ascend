@@ -7,10 +7,10 @@ binaries; execution requires a matching frozen contract and verified artifact.
 
 Ascend C operator sources live under `csrc/kernels/<domain>/<op>/`. Use `python -m flashinfer list-kernels` for the current native registry. Examples include
 
-- `gemm/matmul_probe/`: bounded v2 native and CATLASS ACLNN probes. Frozen v1/raw
-  launch fixtures live in `tests/fixtures/legacy_ascendc/`, outside build inputs.
+- `gemm/matmul_probe/`: bounded v2 native and CATLASS ACLNN probes.
 - `gemm/matmul/` and `gemm/matmul_bias_silu/`: production native implementations.
 - `gemm/grouped_matmul_swiglu_quant/`: grouped integer GEMM, SwiGLU and quantization.
+- `gemm/grouped_matmul_k_dim/`: grouped FP16/BF16 matmul whose groups split the shared K axis.
 - `attention/flash_attention/`: production CATLASS implementation.
 - `attention/sparse_flash_attention/`: arch22 MLA sparse attention, with separate A2 and A3 AOT declarations.
 

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.support.pytest_plugin import _soc_scope, pytest_collection_finish, pytest_collection_modifyitems
+from tests.conftest import _soc_scope, pytest_collection_finish, pytest_collection_modifyitems
 
 
 class Item:

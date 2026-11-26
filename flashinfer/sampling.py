@@ -7,13 +7,13 @@ from typing import Optional, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-from .runtime import build_signature, current_hardware, dispatch, get_global_registry
+from .runtime.runner import run_operator
 
 
 def _call(name, tensor, *args, **kwargs):
-    signature = build_signature("sampling." + name, (tensor,), layouts=("ND",))
-    decision = dispatch(signature, current_hardware(), backend=None)
-    return get_global_registry().get(decision.kernel_id).runner(tensor, *args, **kwargs)
+    return run_operator(
+        "sampling." + name, (tensor,), (tensor, *args), layouts=("ND",), attributes=kwargs,
+    )
 
 def sampling_from_logits(
     logits: torch.Tensor,

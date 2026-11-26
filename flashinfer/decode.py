@@ -13,12 +13,10 @@ from .runtime import (
     Backend,
     InputSignature,
     Plan,
-    build_signature,
     current_hardware,
-    dispatch,
     get_global_registry,
 )
-from .runtime.runner import run_selected as _run_selected
+from .runtime.runner import run_operator
 from .attention.single_decode_graph import SingleDecodeWithKVCacheWrapper
 
 _OP_DECODE = "attention.decode"
@@ -280,27 +278,14 @@ def cudnn_batch_decode_with_kv_cache(
             q.shape[0], q.shape[1], v_cache.shape[-1],
             device=q.device, dtype=q.dtype,
         )
-    signature = build_signature(
-        _OP_CUDNN_DECODE,
-        (q, k_cache, v_cache, actual_seq_lens_kv, block_tables),
-        specializations={
-            "scale": float(scale),
-            "max_sequence_kv": int(max_sequence_kv),
-        },
-    )
-    decision = dispatch(
-        signature, current_hardware(), backend=backend, kernel_id=kernel_id
-    )
-    _run_selected(
-        decision.kernel_id,
-        q,
-        k_cache,
-        v_cache,
-        float(scale),
-        int(max_sequence_kv),
-        actual_seq_lens_kv,
-        block_tables,
-        out,
+    run_operator(
+        _OP_CUDNN_DECODE, (q, k_cache, v_cache, actual_seq_lens_kv, block_tables),
+        (
+            q, k_cache, v_cache, float(scale), int(max_sequence_kv), actual_seq_lens_kv,
+            block_tables, out,
+        ),
+        specializations={'scale': float(scale), 'max_sequence_kv': int(max_sequence_kv)},
+        backend=backend, kernel_id=kernel_id, hardware=current_hardware(),
     )
     return out
 

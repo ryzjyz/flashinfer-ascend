@@ -38,7 +38,7 @@ def project(directory):
     root = Path(directory)
     root.mkdir(parents=True)
     shutil.copyfile(ROOT / "pyproject.toml", root / "pyproject.toml")
-    for name in ("CMakeLists.txt", "cmake"):
+    for name in ("CMakeLists.txt", "cmake", "aclnn_torch_adapter"):
         source, target = ROOT / "csrc" / name, root / "csrc" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         (
@@ -136,6 +136,17 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
 """
     )
     return root
+
+
+def probe_environment(release, descriptor, spec):
+    """Use the freshly built vendor before torch_npu initializes the child process."""
+    import os
+    from flashinfer.jit.discovery import AotPackageIndex
+    from flashinfer.operators.testing import vendor_directory, vendor_search_path
+
+    match = AotPackageIndex((release,)).find(spec, descriptor=descriptor, target_soc=spec.target_soc)
+    vendor = vendor_directory(match, Path(release).parent / "vendor-aliases")
+    return dict(os.environ, ASCEND_CUSTOM_OPP_PATH=vendor_search_path([vendor], replace=[match.recipe.package_vendor]))
 
 
 def execute(root, release, adapter):

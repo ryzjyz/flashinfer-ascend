@@ -5,7 +5,7 @@ from functools import lru_cache
 from types import SimpleNamespace
 
 from flashinfer.runtime import GraphCapability, SchemaError, build_signature, current_hardware, dispatch, get_global_registry
-from flashinfer.runtime.runner import run_selected
+from flashinfer.runtime.runner import resolve_operator_runner, selection_options
 from .catalog import definition
 from .definition import Invocation
 
@@ -68,28 +68,51 @@ def metadata(name, arguments, *, check_layouts=False):
     return tensors, invocation
 
 
-def signature(name, arguments):
+def signature(name, arguments, *, deferred=False):
     operator = definition(name)
     tensors, invocation = metadata(name, arguments, check_layouts=True)
-    facts = dict(invocation.specializations, tensor_contract="supported",
-                 tensor_contiguity="".join("x" if t is None else "1" if t.is_contiguous() else "0" for t in tensors))
-    facts.update(("attribute." + key, value) for key, value in invocation.attributes.items())
+
+    def build():
+        return _invocation_signature(operator, tensors, invocation)
+
+    return (build if deferred else build()), tensors, invocation
+
+
+def _invocation_options(invocation):
+    options = dict(invocation.specializations)
+    options.update(("attribute." + key, value) for key, value in invocation.attributes.items())
+    return options
+
+
+def _invocation_signature(operator, tensors, invocation):
+    facts = _invocation_options(invocation)
+    facts["tensor_contract"] = "supported"
+    facts["tensor_contiguity"] = "".join("x" if t is None else "1" if t.is_contiguous() else "0" for t in tensors)
     result = build_signature(operator.op, tensors, inference=invocation.inference, specializations=facts)
     output_count = len(invocation.outputs)
     return replace(result,
         dtypes=tuple("none" if t is None else d for t, d in zip(tensors, result.dtypes)),
-        physical_layouts=result.physical_layouts[:-output_count] + ("ND",) * output_count), tensors, invocation
+        physical_layouts=result.physical_layouts[:-output_count] + ("ND",) * output_count)
 
 
 def execute(name, arguments):
     import torch
     operator = definition(name)
-    request, tensors, invocation = signature(name, arguments)
-    decision = dispatch(request, current_hardware(), backend=arguments.get("backend"), kernel_id=arguments.get("kernel_id"))
-    selected = get_global_registry().get(decision.kernel_id)
+    request, tensors, invocation = signature(name, arguments, deferred=True)
+    # A prebuilt request already carries the semantic facts. For lazy construction,
+    # include inferred outputs and semantic flags alongside the raw schema arguments.
+    facts = ()
+    if callable(request):
+        options = selection_options(_invocation_options(invocation).items())
+        facts = (invocation.outputs, invocation.inference, options) if options is not None else None
+    kid, runner = resolve_operator_runner(
+        operator.op, (), arguments, request, hardware=current_hardware(), facts=facts,
+        backend=arguments.get("backend"), kernel_id=arguments.get("kernel_id"), select=dispatch,
+    )
     if any(t is not None and t.device.type == torch._C._get_privateuse1_backend_name() for t in tensors):
         import torch_npu
-        if torch_npu.npu.is_current_stream_capturing() and selected.graph_capability == GraphCapability.NOT_CAPTURABLE:
+        if (torch_npu.npu.is_current_stream_capturing()
+                and get_global_registry().get(kid).graph_capability == GraphCapability.NOT_CAPTURABLE):
             raise SchemaError(operator.name + " graph_capability=NOT_CAPTURABLE")
     if operator.validate_values is not None:
         operator.validate_values(arguments)
@@ -97,7 +120,7 @@ def execute(name, arguments):
     if arguments.get("out") is None:
         outputs = tuple(allocate_output(s) for s in invocation.outputs)
         tensors = invocation.inputs + outputs
-    run_selected(decision.kernel_id, *tensors, **invocation.attributes)
+    runner(*tensors, **invocation.attributes)
     return outputs[0] if len(outputs) == 1 else outputs
 
 
@@ -161,8 +184,10 @@ def torch_declarations():
     for record in entries():
         operator = definition(record["op"])
         if not record["export"]:
-            import importlib
-            provider = getattr(importlib.import_module(record["module"]), "torch_declarations", None)
+            provider = operator.torch_declarations
+            if provider is None:
+                import importlib
+                provider = getattr(importlib.import_module(record["module"]), "torch_declarations", None)
             if provider is not None:
                 declarations.extend(provider())
             continue

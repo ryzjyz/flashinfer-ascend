@@ -1,7 +1,7 @@
 """Execute an exported standard op-package via ACLNN, optionally denying exec.
 
-No torch, CATLASS, source tree, JIT cache or compiler is needed by this process.
-The fixed 16x16 FP32 probe checks all 256 values against an independent CPU GEMM.
+The fixed 16x16 FP32 probe submits via the packaged Torch/ACLNN bridge and
+checks all 256 output values against an independent CPU GEMM.
 """
 
 import argparse
@@ -9,7 +9,6 @@ import ctypes as C
 import json
 import os
 from pathlib import Path
-import sys
 
 
 def deny_compilers(cann_root):
@@ -64,92 +63,37 @@ def deny_compilers(cann_root):
 
 
 def execute(module, cann_root):
-    acl = C.CDLL(str(cann_root / "lib64/libascendcl.so"), mode=C.RTLD_GLOBAL)
-    prototypes = {
-        "aclInit": [C.c_char_p], "aclFinalize": [],
-        "aclrtSetDevice": [C.c_int], "aclrtResetDevice": [C.c_int],
-        "aclrtCreateStream": [C.POINTER(C.c_void_p)], "aclrtDestroyStream": [C.c_void_p],
-        "aclrtSynchronizeStream": [C.c_void_p],
-        "aclrtMalloc": [C.POINTER(C.c_void_p), C.c_size_t, C.c_int], "aclrtFree": [C.c_void_p],
-        "aclrtMemcpy": [C.c_void_p, C.c_size_t, C.c_void_p, C.c_size_t, C.c_int],
-    }
-    for name, arguments in prototypes.items():
-        function = getattr(acl, name)
-        function.argtypes, function.restype = arguments, C.c_int
+    import torch
+    from flashinfer.jit.tensor_adapter import TorchOpPackageRunner
 
-    def call(name, *arguments):
-        status = getattr(acl, name)(*arguments)
-        if status:
-            raise RuntimeError("%s returned %s" % (name, status))
-
-    base = C.CDLL(str(cann_root / "lib64/libnnopbase.so"), mode=C.RTLD_GLOBAL)
-    base.aclCreateTensor.argtypes = [C.POINTER(C.c_int64), C.c_uint64, C.c_int,
-        C.POINTER(C.c_int64), C.c_int64, C.c_int, C.POINTER(C.c_int64), C.c_uint64, C.c_void_p]
-    base.aclCreateTensor.restype = C.c_void_p
-    base.aclDestroyTensor.argtypes, base.aclDestroyTensor.restype = [C.c_void_p], C.c_int
-    stream, workspace = C.c_void_p(), C.c_void_p()
-    allocations, tensors = [], []
-    call("aclInit", None)
-    try:
-        call("aclrtSetDevice", 0)
-        call("aclrtCreateStream", C.byref(stream))
-        array = C.c_float * 256
-        ha = array(*(float(i % 7 - 3) for i in range(256)))
-        hb = array(*(float(i % 5 - 2) for i in range(256)))
-        hc = array(*([float("nan")] * 256))
-        dims, strides = (C.c_int64 * 2)(16, 16), (C.c_int64 * 2)(16, 1)
-        for host in (ha, hb, hc):
-            pointer = C.c_void_p()
-            call("aclrtMalloc", C.byref(pointer), C.sizeof(host), 0)
-            allocations.append(pointer)
-            call("aclrtMemcpy", pointer, C.sizeof(host), C.cast(host, C.c_void_p), C.sizeof(host), 1)
-            tensor = base.aclCreateTensor(dims, 2, 0, strides, 0, 2, dims, 2, pointer)
-            if not tensor:
-                raise RuntimeError("aclCreateTensor failed")
-            tensors.append(tensor)
-        workspace_bytes, executor = module.get_workspace_size(*tensors)
-        print("GetWorkspaceSize=0 bytes=" + str(workspace_bytes), flush=True)
-        if workspace_bytes:
-            call("aclrtMalloc", C.byref(workspace), workspace_bytes, 0)
-        module.launch(workspace, workspace_bytes, executor, stream)
-        print(module.recipe.host_entry + "=0", flush=True)
-        call("aclrtSynchronizeStream", stream)
-        call("aclrtMemcpy", C.cast(hc, C.c_void_p), C.sizeof(hc), allocations[2], C.sizeof(hc), 2)
-        expected = [sum(ha[m * 16 + k] * hb[k * 16 + n] for k in range(16))
-                    for m in range(16) for n in range(16)]
-        if not all(hc[i] == expected[i] for i in range(256)):
-            raise AssertionError("ACLNN NPU output differs from independent CPU GEMM")
-        return dict(shape=[16, 16, 16], device=0, stream_sync=0,
-            max_abs_error=max(abs(hc[i] - expected[i]) for i in range(256)), first8=list(hc)[:8])
-    finally:
-        for tensor in reversed(tensors):
-            if base.aclDestroyTensor(tensor):
-                raise RuntimeError("aclDestroyTensor failed")
-        if workspace.value:
-            call("aclrtFree", workspace)
-        for pointer in reversed(allocations):
-            call("aclrtFree", pointer)
-        if stream.value:
-            call("aclrtDestroyStream", stream)
-        call("aclrtResetDevice", 0)
-        call("aclFinalize")
+    runner = TorchOpPackageRunner(module, module.recipe)
+    a = (torch.arange(256) % 7 - 3).float().reshape(16, 16)
+    b = (torch.arange(256) % 5 - 2).float().reshape(16, 16)
+    out = torch.empty_like(a, device="npu")
+    runner(a.npu(), b.npu(), out)
+    result = out.cpu()
+    expected = a @ b
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    return dict(shape=[16, 16, 16], device=out.device.index,
+                max_abs_error=(result - expected).abs().max().item(), first8=result.flatten()[:8].tolist())
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True, help="verified exported generation directory")
-    parser.add_argument("--soc", default="ascend950")
+    parser.add_argument("--soc", default="Ascend950")
     parser.add_argument("--cann-root", type=Path, default=os.environ.get("ASCEND_HOME_PATH"))
     parser.add_argument("--deny-compilers", action="store_true")
     args = parser.parse_args()
+    import torch_npu
     if args.deny_compilers:
         deny_compilers(args.cann_root)
     from flashinfer.jit.op_package import load_op_package
 
-    module = load_op_package(args.package, target_soc=args.soc)
+    from flashinfer.runtime.targets import canonical_soc_model
+    module = load_op_package(args.package, target_soc=canonical_soc_model(args.soc))
     print("LOAD_OK: ascendc_op_package entry=" + module.recipe.host_entry, flush=True)
     result = execute(module, args.cann_root)
-    assert "torch_npu" not in sys.modules and "triton" not in sys.modules
     print("PASS", json.dumps(dict(implementation=module.recipe.implementation,
         compilers_blocked=args.deny_compilers, **result), sort_keys=True), flush=True)
 

@@ -1,7 +1,6 @@
 """Only explicit v2 ACLNN contracts can be authored, selected or published."""
 
 from dataclasses import replace
-import hashlib
 import inspect
 import json
 import os
@@ -14,12 +13,10 @@ import pytest
 from flashinfer.aot.build import export_op_package
 from flashinfer._resources import data_root, recipe_root
 from flashinfer.jit import AscendCBuildConfig, BuildRecipe, load_build_recipes, resolve_build_recipe
-from flashinfer.jit.core import JitSpec, _canonical_hash
+from flashinfer.jit.core import JitSpec
 from flashinfer.jit.op_package import OP_PACKAGE_ADAPTER_HASH, OpPackageModule
 from flashinfer.jit.torch_library import matmul_probe_op
 from flashinfer.runtime import SchemaError
-from tests.support.legacy_ascendc import ROOT as LEGACY_ROOT, load_build_recipes as load_legacy
-from tests.support.legacy_ascendc import resolve_build_recipe as resolve_legacy
 from tests.packaging.test_ascendc_op_package import generation, unit
 
 from tests.production_inventory import PUBLIC_RECIPES, PRODUCTION_OPS
@@ -36,38 +33,30 @@ def test_public_manifest_set_is_exactly_v2_and_preserves_production_inventory():
     assert AscendCBuildConfig().output_kind == 'op_package'
 
 
-def test_public_construction_manifest_config_and_release_reject_v1(generation, tmp_path):
-    original = json.loads((LEGACY_ROOT / 'csrc/recipes/matmul_probe.json').read_text())
-    for record in original:
-        with pytest.raises(SchemaError, match='schema_version=2'):
-            BuildRecipe.from_dict(record)
-    with pytest.raises(SchemaError, match='schema_version=2'):
-        load_build_recipes(LEGACY_ROOT / 'csrc/recipes/matmul_probe.json')
-    for output in ('host_shared', 'host_shared.v1'):
+def test_public_construction_manifest_config_and_release_reject_v1(generation, unit, tmp_path, monkeypatch):
+    recipe = unit[0]
+    old = dict(recipe.to_dict(), schema_version=1)
+    with pytest.raises(SchemaError, match="schema_version=2"):
+        BuildRecipe.from_dict(old)
+    manifest = tmp_path / "old.json"
+    manifest.write_text(json.dumps([old]))
+    with pytest.raises(SchemaError, match="schema_version=2"):
+        load_build_recipes(manifest)
+    for output in ("host_shared", "host_shared.v1"):
         with pytest.raises(SchemaError):
             AscendCBuildConfig(output_kind=output)
-    with pytest.raises(SchemaError, match='legacy v1'):
-        AscendCBuildConfig().select(load_legacy(LEGACY_ROOT / 'csrc/recipes/matmul_probe.json'), 'matmul_probe')
-    with pytest.raises(SchemaError, match='legacy artifacts are read-only'):
-        resolve_build_recipe(load_legacy(LEGACY_ROOT / 'csrc/recipes/matmul_probe.json')[0],
-                             source_root=LEGACY_ROOT, toolchain_fingerprint='a' * 64)
+    # Exercise the public rejection boundaries without building an obsolete operator.
+    from types import SimpleNamespace
+    old_recipe = SimpleNamespace(**old)
+    with pytest.raises(SchemaError, match="legacy v1"):
+        AscendCBuildConfig().select((old_recipe,), "matmul_probe")
+    with pytest.raises(SchemaError, match="legacy artifacts are read-only"):
+        resolve_build_recipe(old_recipe, source_root=ROOT, toolchain_fingerprint="a" * 64)
     store, record, _ = generation
-    with pytest.raises(SchemaError, match='new releases require a v2 recipe'):
-        export_op_package(store.directory(record), tmp_path / 'public-release')
-    assert not (tmp_path / 'public-release').exists()
-
-
-def test_internal_v1_records_and_source_closure_keep_original_identity():
-    raw = json.loads((LEGACY_ROOT / 'csrc/recipes/matmul_probe.json').read_text())
-    recipes = load_legacy(LEGACY_ROOT / 'csrc/recipes/matmul_probe.json')
-    assert len(recipes) == 7
-    assert json.loads(json.dumps([r.to_dict() for r in recipes])) == raw
-    for recipe, record in zip(recipes, raw):
-        assert recipe.fingerprint == _canonical_hash(record)
-        for ref in recipe.sources + recipe.headers + recipe.host_sources:
-            assert hashlib.sha256((LEGACY_ROOT / ref.locator).read_bytes()).hexdigest() == ref.digest
-        if recipe.implementation == 'native':
-            resolve_legacy(recipe, source_root=LEGACY_ROOT, toolchain_fingerprint='a' * 64)
+    monkeypatch.setattr("flashinfer.aot.build.verify_op_package", lambda *args: ({}, old_recipe))
+    with pytest.raises(SchemaError, match="new releases require a v2 recipe"):
+        export_op_package(store.directory(record), tmp_path / "public-release")
+    assert not (tmp_path / "public-release").exists()
 
 
 def test_v2_probe_has_explicit_fixed_tensor_and_resource_contract():

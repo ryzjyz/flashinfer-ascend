@@ -67,7 +67,7 @@ def _verify_output(spec: JitSpec, directory: Path) -> ArtifactRef:
         hashlib.sha256(payload).hexdigest(), spec.target_soc, spec.fingerprint, len(payload),
         entry_point=spec.entry_points[0])
     if format == ArtifactFormat.TRITON_NPUBIN:
-        _triton_files(directory, artifact, spec.fingerprint)
+        _triton_files(directory, artifact, spec)
     artifact.verify_file(directory)
     return artifact
 

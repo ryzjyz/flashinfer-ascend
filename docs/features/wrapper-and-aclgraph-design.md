@@ -206,13 +206,14 @@ wrapper 调 `prepare` 后，`run` 绑定当前 Tensor，在合法 stream 上提�
 该路径不逐次走旧 `GetWorkspaceSize` 调用链，也不重新生成已经冻结的 tiling。
 不得把现有 `aclOpExecutor*` 直接缓存为这个 handle；其复用规则未验证。
 
-旧桥的同步与临时资源释放成套保留。新桥单独实现异步调用的资源租约、完成事件和异常清理；
-不能只把旧 `RunOpApi(..., true)` 改成异步而立即释放描述符、workspace 或镜像。
-现有桥显式使用 `RunOpApi(..., true)`，参见 [ACLNN 桥](../../csrc/aclnn_torch_adapter/adapter.cpp)；
-新桥必须单独验证捕获内启动以及捕获外事件管理，不沿用旧桥可入图的假设。
+现有 [ACLNN eager 桥](../../csrc/aclnn_torch_adapter/adapter.cpp) 在调用线程查询 workspace，
+通过 TorchNPU 在当前流提交 ACLNN 启动。队列回调持有描述符和参数，分配器记录 Tensor 与 workspace 的使用流。
+prepared 桥还需单独验证捕获内启动、捕获外事件管理及镜像的生命周期。
 编译、反序列化、SDK 初始化和 binary 装载在预热完成前结束；捕获期间不做冷加载。
 
 ## 7. CANN 与 Triton 接入
+
+eager 下 Triton 默认使用 TorchNPU 队列和调用方的当前流。显式设置 `TRITON_ENABLE_TASKQUEUE=0` 会选择独立缓存的直接启动器。此时仓库先排空当前流待下发的 Host 任务以保序，本机 triton-ascend 3.6 的直接启动器还会等待设备流完成。
 
 | 后端路径 | 适配策略 | 不得外推的结论 |
 | --- | --- | --- |

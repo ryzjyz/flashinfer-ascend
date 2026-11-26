@@ -17,6 +17,7 @@ def _gemma_fused_add_rmsnorm_kernel(
     hidden,
     eps,
     BLOCK: tl.constexpr,
+    QUEUED_LAUNCH: tl.constexpr,  # The generated Host launcher differs for these specializations.
 ):
     """每 program 处理一行：r += x；x = (r / RMS(r)) * (w + 1)。
 
@@ -40,6 +41,11 @@ def _gemma_fused_add_rmsnorm_kernel(
 
 def gemma_fused_add_rmsnorm(input, residual, weight, eps: float) -> None:
     """原地执行 gemma fused add rmsnorm（2D 语义，末维归一化）。"""
+    import torch
+    from flashinfer.jit._triton_abi import record_tensor_streams, task_queue_enabled
+
+    if input.device != residual.device or input.device != weight.device:
+        raise ValueError("Gemma input, residual and weight must share the same NPU")
     assert input.shape == residual.shape, "input 与 residual 形状须一致"
     assert weight.shape == input.shape[-1:], "weight 形状须为 (hidden_size,)"
     assert input.is_contiguous() and residual.is_contiguous(), "输入须连续"
@@ -48,6 +54,9 @@ def gemma_fused_add_rmsnorm(input, residual, weight, eps: float) -> None:
     x2d = input.view(-1, hidden)
     r2d = residual.view(-1, hidden)
     BLOCK = triton.next_power_of_2(hidden)
-    _gemma_fused_add_rmsnorm_kernel[(x2d.shape[0],)](
-        x2d, r2d, weight, hidden, float(eps), BLOCK=BLOCK
-    )
+    with torch.npu.device(input.device):
+        queued = task_queue_enabled()
+        record_tensor_streams((input, residual, weight), drain_host_queue=not queued)
+        _gemma_fused_add_rmsnorm_kernel[(x2d.shape[0],)](
+            x2d, r2d, weight, hidden, float(eps), BLOCK=BLOCK, QUEUED_LAUNCH=queued
+        )

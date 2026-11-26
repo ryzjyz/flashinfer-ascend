@@ -154,7 +154,7 @@ class AttentionResourcePlanGateTests(unittest.TestCase):
 import math
 
 import pytest
-from tests.support.pytest_plugin import a5_device as npu
+from tests.conftest import a5_device as npu
 
 from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
@@ -400,14 +400,25 @@ def test_prefill_query_shape_requeries_without_new_freezes(npu, monkeypatch):
 @pytest.mark.requires_soc("Ascend950")
 def test_replan_larger_requirement_does_not_publish(npu):
     import torch
-    ws = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=npu)
+    import torch_npu
+
+    # Query the native requirement independently of the wrapper. Tiling and
+    # workspace sizes can differ between CANN builds for the same input shapes.
+    q = torch.empty((1, 3, 8, 128), dtype=torch.float16, device=npu)
+    k = torch.empty((1, 4096, 2, 128), dtype=q.dtype, device=npu)
+    v = torch.empty_like(k)
+    required = max(torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+        q, k, v, input_layout="BSND", num_heads=8, num_key_value_heads=2,
+        scale=128 ** -.5, softmax_lse_flag=lse).nbytes for lse in (False, True))
+    ws = torch.empty(required - 1, dtype=torch.uint8, device=npu)
     wrapper = BatchPrefillWithRaggedKVCacheWrapper(ws, use_cuda_graph=True, use_max_workspace=True,
         qo_indptr_buf=index([-7, -7], npu), kv_indptr_buf=index([-7, -7], npu))
     wrapper.plan(index([0, 1]), index([0, 1]), 8, 2, 128)
     previous, contract, cache_key = wrapper.plan_state, wrapper.workspace_contract, wrapper._native_max_workspace_key
     before = tuple(buffer.tolist() for buffer in wrapper._fixed_graph_buffers)
-    with pytest.raises(SchemaError, match="requires 35913728"):
+    with pytest.raises(SchemaError) as error:
         wrapper.plan(index([0, 3]), index([0, 4096]), 8, 2, 128)
+    assert str(error.value) == f"float workspace capacity is {ws.nbytes} bytes, requires {required}"
     assert wrapper.plan_state is previous and wrapper.workspace_contract is contract
     assert wrapper._native_max_workspace_key == cache_key
     assert tuple(buffer.tolist() for buffer in wrapper._fixed_graph_buffers) == before
