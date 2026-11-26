@@ -80,12 +80,29 @@ public:
         // kernel ABI forwards Tensor arguments plus workspace/tiling only.
         // 1e-6 preserves the frozen contract, DS4.1 callers may pass 1e-20.
         this->Attr("rms_norm_eps").AttrType(OPTIONAL).Float(1e-6);
+        // Local Q head count in [1,64] (default 64) for TP sharding. Host
+        // tiling validates it and threads it through the tiling payload; the
+        // kernel ABI gains no new scalar parameter.
+        this->Attr("q_head_num").AttrType(OPTIONAL).Int(64);
+        // true (default): fused behavior, the kernel scatters the KV row into
+        // kv_cache and leaves the kv output unwritten (no extra GM write on
+        // the fused path). false: kv_cache and slot_indices are ignored and
+        // the same [t,512] BF16 row is written to the kv output instead.
+        // Host tiling threads it through the tiling payload (no device scalar).
+        this->Attr("update_kv_cache").AttrType(OPTIONAL).Bool(true);
         this->Output("q_output")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16})
             .Format({ge::FORMAT_ND});
         // Required second output: BF16 q_norm(wq_a(x)), [t,1280] ND.
         this->Output("qr")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_BF16})
+            .Format({ge::FORMAT_ND});
+        // BF16 [t,512] KV row. Declared in both modes because the ACLNN ABI
+        // has a static output list; update_kv_cache decides whether it is
+        // written. With true the buffer is allocated but never touched.
+        this->Output("kv")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16})
             .Format({ge::FORMAT_ND});

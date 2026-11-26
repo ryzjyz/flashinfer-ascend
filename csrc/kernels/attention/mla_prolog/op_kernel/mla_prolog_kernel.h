@@ -52,13 +52,16 @@ namespace Dsv41 {
 constexpr uint32_t kHidden = 5120;
 constexpr uint32_t kQa = 1280;
 constexpr uint32_t kKv = 512;
-constexpr uint32_t kHeads = 64;
+// Local Q head count is a runtime value (1..64, one per TP shard); the fixed
+// 64 is only the staging/capacity bound. Q-B output channels N are
+// headNum * kHeadDim, never a compile-time constant.
+constexpr uint32_t kMaxHeads = 64;
+constexpr uint32_t kMinHeads = 1;
 constexpr uint32_t kHeadDim = 512;
 constexpr uint32_t kNopeDim = 448;
 constexpr uint32_t kRopeDim = 64;
 constexpr uint32_t kCacheRowsPerPage = 128;
 constexpr uint32_t kMaxT = 4096;
-constexpr uint32_t kQbOut = kHeads * kHeadDim;
 constexpr uint32_t kWorkspaceStages = 2;
 // Split-K of the S0 dual projection: K=5120 is divided into per-split extents that
 // are multiples of kProjectionSplitKTile (e.g. {1792, 1792, 1536} for 3 splits), so
@@ -96,6 +99,33 @@ static_assert(kProjectionSplitsMid >= 1U && kProjectionSplitsMid <= kMaxProjecti
 static_assert(kProjectionSplitsMid <= kProjectionSplitsSmall || kSplitProjectionMidMaxT <= kSplitProjectionMaxT,
     "split count should not increase with T");
 constexpr bool kEnableRopeScatter = true;
+// E1b / F21 single-stream M-chunk pipeline (S0 -> S1). Gate on both sides:
+// projectionSplits == 1 && t > 384 (excludes split=3 and narrow-M). Only the
+// Q stream is chunk-gated: AIC announces qa chunk g on flag 6 (mode 0x2 =
+// paired AIVs), once per chunk per core including empty chunks. Each AIV
+// waits its paired AIC's chunk flag and then runs an all-AIV barrier, which
+// aggregates the 24 AIC announcements; only then may it read the qa partials.
+// The KV stream uses ONE group: each AIC sets flag 7 once after its last tile
+// (flag 6 then flag 7 are the only cross-core sets S0 emits on this path), and
+// every AIV waits flag 7 once and runs one barrier before its first KV row.
+constexpr bool kE1Pipeline = true;
+constexpr Arch::FlagID kE1ChunkQaFlag = 6;
+constexpr Arch::FlagID kE1ChunkKvFlag = 7;
+constexpr uint32_t kE1ChunkMTiles = 3U;
+
+// narrowM is the host's 64-row M-tile tier (split=1, T in (128, 192]). AIC
+// chunks the Q stream by kE1ChunkMTiles * mTile while S1 always consumes
+// kE1ChunkMTiles * Bf16L1Tile::M rows per chunk, so the pipeline must never
+// engage on the narrow-M tier even if its T range is ever widened.
+CATLASS_HOST_DEVICE constexpr bool E1PipelineOn(
+    uint32_t splits, uint32_t t, uint32_t narrowM)
+{
+    return kE1Pipeline && (splits == 1U) && (t > 384U) && (narrowM == 0U);
+}
+// E1 owns flags 6/7; the QMM stage-2 ring also maps to 6/7 (see
+// QuantMatmulFullLoadAWorkspace below). The two must never be combined.
+static_assert(!kE1Pipeline || kWorkspaceStages == 2U,
+    "E1 chunk flags 6/7 alias the QMM stage-2 ring; a 3-stage QMM requires kE1Pipeline=false");
 constexpr float kProjectionUlpGuard = 1.000006F;
 constexpr float kProjectionGeneralGuard = 0.99999994F;
 constexpr float kRmsNormUlpGuard = 1.0000055F;
@@ -146,7 +176,8 @@ struct WorkspaceLayout {
     uint64_t totalBytes;
 };
 
-inline WorkspaceLayout MakeWorkspaceLayout(uint32_t t, uint32_t aicCount)
+inline WorkspaceLayout MakeWorkspaceLayout(uint32_t t, uint32_t aicCount,
+                                           uint32_t headNum)
 {
     WorkspaceLayout layout{};
     layout.qaOffset = 0;
@@ -167,7 +198,9 @@ inline WorkspaceLayout MakeWorkspaceLayout(uint32_t t, uint32_t aicCount)
     layout.qScaleOffset = layout.qInt8Offset + layout.qInt8Bytes;
     layout.qScaleBytes = Align512(static_cast<uint64_t>(t) * sizeof(float));
     layout.wScaleFpOffset = layout.qScaleOffset + layout.qScaleBytes;
-    layout.wScaleFpBytes = Align512(static_cast<uint64_t>(kQbOut) * sizeof(float));
+    // One FP32 weight-dequant scale per Q-B output channel (headNum * 512).
+    layout.wScaleFpBytes = Align512(
+        static_cast<uint64_t>(headNum) * kHeadDim * sizeof(float));
     layout.qmmOffset = layout.wScaleFpOffset + layout.wScaleFpBytes;
     layout.qmmBytes = Align512(
         static_cast<uint64_t>(aicCount) * kWorkspaceStages * 128U * 256U * sizeof(int32_t));
@@ -321,12 +354,47 @@ struct DualProjectionKernel {
         gmQa.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(params.qa));
         gmKv.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(params.kv));
 
+        // E1b/F21 single-stream M-chunk pipeline: only the Q stream is chunk
+        // gated. qa chunk g = the 3 M-tiles [3g, 3g+3) x all qa N tiles (the Zn
+        // swizzle already enumerates the tiles chunk-major for chunk width 3).
+        // Each core announces every qa chunk exactly once, after its own tiles
+        // of that chunk are done, empty chunks included. The KV stream is a
+        // single group: every core runs all of its qa tiles before its kv
+        // tiles, and the measured kv group-ready curve is at the S0 tail, so
+        // one announcement after this core's last tile (see the tail) replaces
+        // the per-chunk kv announcements with no loss of overlap.
+        const bool pipeOn = E1PipelineOn(
+            params.projectionSplits, params.qaShape.m(), params.narrowM);
+        const uint32_t qaTilesPerChunk = kE1ChunkMTiles * qaScheduler.loopsMN.column();
+        const uint32_t qaChunks =
+            (qaScheduler.loopsMN.row() + kE1ChunkMTiles - 1U) / kE1ChunkMTiles;
+        Arch::CrossCoreFlag chunkQa{kE1ChunkQaFlag};
+        Arch::CrossCoreFlag chunkKv{kE1ChunkKvFlag};
+        uint32_t qaAnnounced = 0U;
+
         for (uint32_t loopIdx = AscendC::GetBlockIdx(); loopIdx < totalLoops;
              loopIdx += AscendC::GetBlockNum()) {
             const uint32_t splitId = loopIdx % params.projectionSplits;
             const uint32_t combinedLoop = loopIdx / params.projectionSplits;
             const bool isQa = combinedLoop < qaLoops;
             const uint32_t localLoop = isQa ? combinedLoop : combinedLoop - qaLoops;
+            if (pipeOn) {
+                if (isQa) {
+                    // All earlier qa chunks are complete on this core.
+                    const uint32_t chunk = localLoop / qaTilesPerChunk;
+                    while (qaAnnounced < chunk) {
+                        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkQa);
+                        ++qaAnnounced;
+                    }
+                } else {
+                    // First kv tile: the whole qa stream is complete here, so
+                    // drain the qa chunks this core never announced.
+                    while (qaAnnounced < qaChunks) {
+                        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkQa);
+                        ++qaAnnounced;
+                    }
+                }
+            }
             const uint32_t splitKBase =
                 ProjectionSplitKBase(params.projectionSplits, splitId);
             const uint32_t splitK =
@@ -368,6 +436,18 @@ struct DualProjectionKernel {
                     actualBlockShape);
             }
         }
+        if (pipeOn) {
+            // Tail: announce every qa chunk this core holds no tile for (a
+            // core with fewer than totalLoops/blockNum tiles also drains
+            // here), then the single kv group once, after this core's last
+            // tile. Exactly one kv set per AIC; the qa sets are one per chunk
+            // per AIC. Both stay within the 15-deep cross-core flag bound.
+            while (qaAnnounced < qaChunks) {
+                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkQa);
+                ++qaAnnounced;
+            }
+            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkKv);
+        }
     }
 
     template <>
@@ -388,11 +468,16 @@ struct NormQuantKernel {
         GM_ADDR wScaleFp;
         uint32_t t;
         uint32_t projectionSplits;
+        // Host narrow-M rebalance flag (split=1, T in (128, 192]); the E1 chunk
+        // pipeline must be mutually exclusive with it (see E1PipelineOn).
+        uint32_t narrowM;
         // Required BF16 [t,1280] output: the same normalized BF16 row that
         // feeds dynamic quantization, i.e. q_norm(wq_a(x)).
         GM_ADDR qr;
         // FP32 RMSNorm epsilon applied to both the Q and the KV branch.
         float rmsNormEps;
+        // Local Q head count; w_qb_scale has headNum * kHeadDim entries.
+        uint32_t headNum;
     };
     using Arguments = Params;
 
@@ -404,8 +489,10 @@ struct NormQuantKernel {
             args.wScale != nullptr && args.wScaleFp != nullptr && args.qr != nullptr &&
             args.rmsNormEps > 0.0F &&
             args.t > 0 && args.t <= kMaxT &&
+            args.headNum >= kMinHeads && args.headNum <= kMaxHeads &&
             args.projectionSplits > 0 &&
-            args.projectionSplits <= kMaxProjectionSplits;
+            args.projectionSplits <= kMaxProjectionSplits &&
+            args.narrowM <= 1U;
     }
 
     static size_t GetWorkspaceSize(const Arguments &)
@@ -501,8 +588,10 @@ struct NormQuantKernel {
 
         // This conversion is independent of the projection output. Run it while
         // the AIC side is still producing the projection to hide its latency.
+        // headNum * kHeadDim is always a multiple of kScaleChunk.
         constexpr uint32_t kScaleChunk = 256;
-        for (uint32_t chunk = blockIdx; chunk < kQbOut / kScaleChunk;
+        const uint32_t qbOut = params.headNum * kHeadDim;
+        for (uint32_t chunk = blockIdx; chunk < qbOut / kScaleChunk;
              chunk += blockNum) {
             const uint32_t start = chunk * kScaleChunk;
             AscendC::DataCopy(gammaQaBf16, gmWScale[start], kScaleChunk);
@@ -537,14 +626,59 @@ struct NormQuantKernel {
         AscendC::Cast(gammaKvFp, gammaKvBf16, AscendC::RoundMode::CAST_NONE, kKv);
         AscendC::PipeBarrier<PIPE_V>();
 
-        Arch::CrossCoreFlag projectionReady{4};
-        Arch::CrossCoreWaitFlag(projectionReady);
-        Arch::CrossCoreBarrier<0x0, PIPE_MTE2>();
+        // E1b/F21 pipeline: S1 no longer waits for the whole projection before
+        // any row. The Q stream is gated per chunk on its own AIC announcement
+        // (flag 6); the all-AIV barrier after the wait is the aggregation layer
+        // that turns 24 per-pair notifications into "all AIC tiles of chunk g
+        // are done". The KV stream is a single group (flag 7, set once by each
+        // AIC after its last tile): one wait + one barrier instead of one per
+        // kv chunk. The measured kv group-ready curve is at the S0 tail, i.e.
+        // later than this AIV's last Q row, so the KV rows are not delayed.
+        // Every AIV executes exactly qaChunks + 1 barriers.
+        //
+        // Segment-major traversal: one segment per Q chunk (trailing chunks
+        // with no row on this AIV included) plus one KV segment. The chunk gate
+        // lives in the segment loop, not the row loop, so the non-pipelined
+        // path (t <= 384, narrow-M, split > 1) runs the unchanged row body with
+        // no per-row pipeline branch and no extra state live across it. The
+        // per-AIV row order is identical to the work-strided loop (ascending Q
+        // rows first, then ascending KV rows): 384 is a multiple of blockNum,
+        // so rowBegin + blockIdx hits the same residue class in every chunk.
+        const bool pipeOn = E1PipelineOn(
+            params.projectionSplits, params.t, params.narrowM);
+        // On the gated path narrowM == 0, so the AIC Q chunk is exactly
+        // kE1ChunkMTiles L1 M-tiles; derive S1's row window from the same tile
+        // constant instead of a bare 128.
+        static_assert(Bf16L1Tile::M == 128U, "E1 chunk row math expects the BM=128 L1 tile");
+        const uint32_t pipeChunkRows = kE1ChunkMTiles * Bf16L1Tile::M;
+        const uint32_t pipeChunks =
+            (params.t + pipeChunkRows - 1U) / pipeChunkRows;
+        Arch::CrossCoreFlag chunkQa{kE1ChunkQaFlag};
+        Arch::CrossCoreFlag chunkKv{kE1ChunkKvFlag};
+        if (!pipeOn) {
+            Arch::CrossCoreFlag projectionReady{4};
+            Arch::CrossCoreWaitFlag(projectionReady);
+            Arch::CrossCoreBarrier<0x0, PIPE_MTE2>();
+        }
 
-        const uint32_t workCount = params.t * 2U;
-        for (uint32_t work = blockIdx; work < workCount; work += blockNum) {
-            const bool isQ = work < params.t;
-            const uint32_t row = isQ ? work : work - params.t;
+        const uint32_t qaSegments = pipeOn ? pipeChunks : 1U;
+        for (uint32_t seg = 0; seg <= qaSegments; ++seg) {
+            const bool isQ = seg < qaSegments;
+            if (pipeOn) {
+                if (isQ) {
+                    Arch::CrossCoreWaitFlag(chunkQa);
+                    Arch::CrossCoreBarrier<0x0, PIPE_MTE3>();
+                } else {
+                    Arch::CrossCoreWaitFlag(chunkKv);
+                    Arch::CrossCoreBarrier<0x0, PIPE_MTE3>();
+                }
+            }
+            const uint32_t rowBegin = isQ ? seg * pipeChunkRows : 0U;
+            uint32_t rowEnd = isQ ? rowBegin + pipeChunkRows : params.t;
+            if (rowEnd > params.t) {
+                rowEnd = params.t;
+            }
+            for (uint32_t row = rowBegin + blockIdx; row < rowEnd; row += blockNum) {
             const uint32_t dim = isQ ? kQa : kKv;
             const uint64_t offset = static_cast<uint64_t>(row) * dim;
             auto gmProjection = isQ ? gmQa : gmKv;
@@ -787,6 +921,7 @@ struct NormQuantKernel {
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vMte2);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vMte2);
             }
+            }
         }
 
         pipe->ReleaseEventID<AscendC::HardEvent::MTE2_V>(mte2V);
@@ -799,7 +934,344 @@ struct NormQuantKernel {
     }
 };
 
-using QuantDispatch = Gemm::MmadAtlasA2PreloadAsyncWithCallback<1, 2, 2, 2, 1, true, true>;
+// E2/F13 "full-load-A" variant of Catlass::Gemm::Kernel::QuantMatmulMultiStageWorkspace.
+//
+// Mechanism: the contract QMM has loopsM * loopsN tiles (M = tokens, N = 128
+// head-dim tiles). The stock workspace kernel streams the A tile from GM to L1
+// once per N tile, i.e. loopsN times per M row. This variant uses the CATLASS
+// full-load-A block MMAD, which keeps a whole (L1_TILE_M x K) A tile resident in
+// L1 and skips the GM->L1 A copy whenever the next tile on the same core reuses
+// the same A (needLoadL1). Skipping only fires if a core's consecutive tiles
+// stay inside one M row, which is exactly what
+// GemmIdentityBlockSwizzleL1FullLoad<1, 0> guarantees (Zn order, offset 1:
+// innerIdx = mIdx * loopsN + nIdx for one core's contiguous innerIdx range).
+// Everything else - workspace staging, cross-core flags, the per-token dequant
+// epilogue, the zN B layout - is the stock QuantMatmulMultiStageWorkspace
+// dataflow, so the INT32 workspace content and the BF16 output are unchanged.
+template <class BlockMmad_, class BlockEpilogue_, class BlockScheduler_, uint32_t WORKSPACE_STAGES_>
+class QuantMatmulFullLoadAWorkspace {
+public:
+    using BlockMmad = BlockMmad_;
+    using ArchTag = typename BlockMmad::ArchTag;
+    using L1TileShape = typename BlockMmad::L1TileShape;
+    using ElementA = typename BlockMmad::ElementA;
+    using LayoutA = typename BlockMmad::LayoutA;
+    using ElementB = typename BlockMmad::ElementB;
+    using LayoutB = typename BlockMmad::LayoutB;
+    using ElementC = typename BlockMmad::ElementC;
+    using LayoutC = typename BlockMmad::LayoutC;
+    using ElementAccumulator = typename BlockMmad::ElementAccumulator;
+
+    using BlockEpilogue = BlockEpilogue_;
+    using ElementScale = typename BlockEpilogue::ElementScale;
+    using LayoutScale = typename BlockEpilogue::LayoutScale;
+    using ElementPerTokenScale = typename BlockEpilogue::ElementPerTokenScale;
+    using LayoutPerTokenScale = typename BlockEpilogue::LayoutPerTokenScale;
+    using ElementD = typename BlockEpilogue::ElementD;
+    using LayoutD = typename BlockEpilogue::LayoutD;
+    using EpilogueParams = typename BlockEpilogue::Params;
+
+    using BlockScheduler = BlockScheduler_;
+    static constexpr uint32_t WORKSPACE_STAGES = WORKSPACE_STAGES_;
+
+    /// Parameters structure (identical to QuantMatmulMultiStageWorkspace)
+    struct Params {
+        // Data members
+        GemmCoord problemShape;
+        __gm__ ElementA* ptrA;
+        LayoutA layoutA;
+        __gm__ ElementB* ptrB;
+        LayoutB layoutB;
+        __gm__ ElementScale* ptrScale;
+        LayoutScale layoutScale;
+        __gm__ ElementPerTokenScale* ptrPerTokenScale;
+        LayoutPerTokenScale layoutPerTokenScale;
+        __gm__ ElementD* ptrD;
+        LayoutD layoutD;
+        GM_ADDR ptrWorkspace;
+
+        // Methods
+        CATLASS_HOST_DEVICE
+        Params()
+        {}
+
+        CATLASS_HOST_DEVICE
+        Params(
+            GemmCoord problemShape_, GM_ADDR ptrA_, LayoutA layoutA_, GM_ADDR ptrB_, LayoutB layoutB_,
+            GM_ADDR ptrScale_, LayoutScale layoutScale_, GM_ADDR ptrPerTokenScale_,
+            LayoutPerTokenScale layoutPerTokenScale_, GM_ADDR ptrD_, LayoutD layoutD_, GM_ADDR ptrWorkspace_)
+            : problemShape(problemShape_),
+              ptrA(reinterpret_cast<__gm__ ElementA*>(ptrA_)),
+              layoutA(layoutA_),
+              ptrB(reinterpret_cast<__gm__ ElementB*>(ptrB_)),
+              layoutB(layoutB_),
+              ptrScale(reinterpret_cast<__gm__ ElementScale*>(ptrScale_)),
+              layoutScale(layoutScale_),
+              ptrPerTokenScale(reinterpret_cast<__gm__ ElementPerTokenScale*>(ptrPerTokenScale_)),
+              layoutPerTokenScale(layoutPerTokenScale_),
+              ptrD(reinterpret_cast<__gm__ ElementD*>(ptrD_)),
+              layoutD(layoutD_),
+              ptrWorkspace(ptrWorkspace_)
+        {}
+    };
+
+    struct Arguments {
+        GemmCoord problemShape;
+        uint32_t aicCoreNum;
+        uint8_t* ptrA;
+        uint8_t* ptrB;
+        uint8_t* ptrScale;
+        uint8_t* ptrPerTokenScale;
+        uint8_t* ptrD;
+    };
+
+    static bool CanImplement(const Arguments& args)
+    {
+        return true;
+    }
+
+    static size_t GetWorkspaceSize(const Arguments& args)
+    {
+        size_t lenWorkspace = static_cast<size_t>(L1TileShape::M) * L1TileShape::N * args.aicCoreNum * WORKSPACE_STAGES;
+        size_t sizeWorkspace = lenWorkspace * sizeof(uint32_t);
+        return sizeWorkspace;
+    }
+
+    static Params ToUnderlyingArguments(const Arguments& args, uint8_t* workspace)
+    {
+        uint32_t m = args.problemShape.m();
+        uint32_t n = args.problemShape.n();
+        uint32_t k = args.problemShape.k();
+        LayoutA layoutA = LayoutA::template MakeLayout<ElementA>(m, k);
+        LayoutB layoutB = LayoutB::template MakeLayout<ElementB>(k, n);
+        LayoutScale layoutScale{n};
+        LayoutPerTokenScale layoutPerTokenScale{m};
+        LayoutD layoutD = LayoutD::template MakeLayout<ElementD>(m, n);
+        Params params{
+            args.problemShape,     args.ptrA,           layoutA,   args.ptrB, layoutB,  args.ptrScale, layoutScale,
+            args.ptrPerTokenScale, layoutPerTokenScale, args.ptrD, layoutD,   workspace};
+        return params;
+    }
+
+    // Cross-core flag IDs are an op-global resource. UnifiedMlaPrologKernel owns
+    // 4 (projectionReady) and 5 (normReady); 8..10 are Arch barrier IDs and
+    // FFTS_MAX_FLAG is 7. The stock 2-stage ring used 0..3 - keep stage 0/1
+    // exactly there. Stage 2 is placed at 6/7, which avoids 4/5 but aliases the
+    // E1 Q/KV chunk gates (kE1ChunkQaFlag/kE1ChunkKvFlag); a 3-stage ring is
+    // therefore only legal with the E1 pipeline off, enforced below.
+    static constexpr Arch::FlagID kProjectionReadyFlag = 4;
+    static constexpr Arch::FlagID kNormReadyFlag = 5;
+    static constexpr Arch::FlagID QmmFlagId(uint32_t stageId, uint32_t kind)
+    {
+        return static_cast<Arch::FlagID>((stageId < 2) ? (2 * stageId + kind) : (6 + kind));
+    }
+    static constexpr bool QmmFlagIdsValid()
+    {
+        for (uint32_t stageId = 0; stageId < WORKSPACE_STAGES; ++stageId) {
+            for (uint32_t kind = 0; kind < 2; ++kind) {
+                uint32_t id = QmmFlagId(stageId, kind);
+                if (id == kProjectionReadyFlag || id == kNormReadyFlag || id > 7) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    static_assert(WORKSPACE_STAGES <= 3, "only two free cross-core flag IDs beyond the 2-stage ring");
+    static_assert(
+        QmmFlagIdsValid(),
+        "QMM cross-core flag IDs must avoid 4/5 (projectionReady/normReady) and stay <= FFTS_MAX_FLAG");
+    static_assert(!kE1Pipeline || WORKSPACE_STAGES == 2,
+        "E1 chunk flags 6/7 alias QMM stage-2 flags; a 3-stage ring requires kE1Pipeline=false");
+
+    // Methods
+    CATLASS_DEVICE
+    QuantMatmulFullLoadAWorkspace()
+    {
+        for (uint32_t stageId = 0; stageId < WORKSPACE_STAGES; ++stageId) {
+            flagAicFinishStoreList[stageId] = Arch::CrossCoreFlag(QmmFlagId(stageId, 0));
+            flagAivFinishComputeList[stageId] = Arch::CrossCoreFlag(QmmFlagId(stageId, 1));
+            aicWaitFuncList[stageId] = {this, stageId};
+            aicSetFuncList[stageId] = {this, stageId};
+        }
+    }
+
+    template <int32_t CORE_TYPE = g_coreType>
+    CATLASS_DEVICE void operator()(Params const& params);
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    {
+        BlockScheduler blockScheduler;
+        blockScheduler.Update(params.problemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+        uint32_t coreLoops = blockScheduler.GetCoreLoops();
+
+        BlockMmad blockMmad(resource);
+
+        // Represent the full gm
+        AscendC::GlobalTensor<ElementA> gmA;
+        gmA.SetGlobalBuffer(params.ptrA);
+        AscendC::GlobalTensor<ElementB> gmB;
+        gmB.SetGlobalBuffer(params.ptrB);
+
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreNum = AscendC::GetBlockNum();
+
+        AscendC::GlobalTensor<ElementC> gmC;
+        gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC*>(params.ptrWorkspace));
+        auto layoutC = layout::RowMajor{L1TileShape::M * coreNum * WORKSPACE_STAGES, L1TileShape::N};
+
+        uint32_t stageId = 0;
+        uint32_t stageUsed = 0;
+        int64_t gmOffsetAPreload{0};
+
+        // Loop through the matmul of each groupIdx
+        for (uint32_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+            // Compute block location
+            GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
+            GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
+
+            Callback callbackBeforeFixpipe{};
+            if (stageUsed == WORKSPACE_STAGES) {
+                callbackBeforeFixpipe = MakeCallback(&aicWaitFuncList[stageId]);
+            } else {
+                ++stageUsed;
+            }
+            Callback callbackAfterFixpipe = MakeCallback(&aicSetFuncList[stageId]);
+
+            // Compute initial location in logical coordinates
+            MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
+            MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
+            MatrixCoord offsetC{(stageId * coreNum + coreIdx) * L1TileShape::M, 0};
+            int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+            int64_t gmOffsetB = params.layoutB.GetOffset(offsetB);
+            int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+
+            // Judge whether the current blockA is already on L1Cache
+            bool isFirstBlock = (loopIdx == coreIdx);
+            bool needLoadL1 = true;
+            if (isFirstBlock) {
+                gmOffsetAPreload = gmOffsetA;
+            } else {
+                if (gmOffsetA == gmOffsetAPreload) {
+                    needLoadL1 = false;
+                } else {
+                    gmOffsetAPreload = gmOffsetA;
+                }
+            }
+
+            // Compute block-scoped matrix multiply-add
+            callbackBeforeFixpipe();
+            blockMmad(
+                gmA[gmOffsetA], params.layoutA, gmB[gmOffsetB], params.layoutB, gmC[gmOffsetC], layoutC,
+                actualBlockShape, needLoadL1);
+            callbackAfterFixpipe();
+
+            stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+        }
+
+        while (stageUsed > 0) {
+            uint32_t aivComputeStageId =
+                (stageId >= stageUsed) ? (stageId - stageUsed) : (stageId + WORKSPACE_STAGES - stageUsed);
+            Arch::CrossCoreWaitFlag(flagAivFinishComputeList[aivComputeStageId]);
+            --stageUsed;
+        }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIV>(Params const& params)
+    {
+        BlockScheduler blockScheduler;
+        BlockEpilogue blockEpilogue(resource);
+
+        uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        uint32_t coreNum = AscendC::GetBlockNum();
+
+        AscendC::GlobalTensor<ElementC> gmC;
+        gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC*>(params.ptrWorkspace));
+        auto layoutC = layout::RowMajor{L1TileShape::M * coreNum * WORKSPACE_STAGES, L1TileShape::N};
+
+        uint32_t stageId = 0;
+
+        LayoutScale layoutScale = params.layoutScale;
+        LayoutPerTokenScale layoutPerTokenScale =
+            params.layoutPerTokenScale.GetTileLayout(params.problemShape.template GetCoordByAxis<0>());
+        LayoutD layoutD = params.layoutD.GetTileLayout(params.problemShape.GetCoordMN());
+
+        EpilogueParams epilogueParams{params.ptrScale,     layoutScale, params.ptrPerTokenScale,
+                                      layoutPerTokenScale, params.ptrD, layoutD};
+
+        blockScheduler.Update(params.problemShape, L1TileShape::ToCoordMN());
+        blockEpilogue.UpdateParams(epilogueParams);
+        uint32_t coreLoops = blockScheduler.GetCoreLoops();
+
+        GemmCoord blockShapeMNK = L1TileShape::ToCoord();
+        for (uint32_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+            GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
+            GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
+
+            MatrixCoord offsetC{(stageId * coreNum + coreIdx) * L1TileShape::M, 0};
+            int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+            auto gmBlockC = gmC[gmOffsetC];
+            auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
+
+            Arch::CrossCoreWaitFlag(flagAicFinishStoreList[stageId]);
+            blockEpilogue(blockShapeMNK, blockCoordMNK, actualBlockShapeMNK, gmBlockC, layoutBlockC);
+            Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(flagAivFinishComputeList[stageId]);
+
+            stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+        }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+private:
+    friend struct AicWaitFunc;
+    friend struct AicSetFunc;
+
+    struct AicWaitFunc {
+        using MatmulKernel = QuantMatmulFullLoadAWorkspace<BlockMmad, BlockEpilogue, BlockScheduler, WORKSPACE_STAGES>;
+
+        CATLASS_DEVICE
+        AicWaitFunc() = default;
+
+        CATLASS_DEVICE
+        void operator()() const
+        {
+            Arch::CrossCoreWaitFlag(ptr->flagAivFinishComputeList[stageId]);
+        }
+
+        MatmulKernel* ptr{nullptr};
+        uint32_t stageId;
+    };
+
+    struct AicSetFunc {
+        using MatmulKernel = QuantMatmulFullLoadAWorkspace<BlockMmad, BlockEpilogue, BlockScheduler, WORKSPACE_STAGES>;
+
+        CATLASS_DEVICE
+        AicSetFunc() = default;
+
+        CATLASS_DEVICE
+        void operator()() const
+        {
+            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(ptr->flagAicFinishStoreList[stageId]);
+        }
+
+        MatmulKernel* ptr{nullptr};
+        uint32_t stageId;
+    };
+
+    Arch::CrossCoreFlag flagAicFinishStoreList[WORKSPACE_STAGES];
+    Arch::CrossCoreFlag flagAivFinishComputeList[WORKSPACE_STAGES];
+
+    AicWaitFunc aicWaitFuncList[WORKSPACE_STAGES];
+    AicSetFunc aicSetFuncList[WORKSPACE_STAGES];
+    Arch::Resource<ArchTag> resource;
+};
+
+using QuantDispatch = Gemm::MmadAtlasA2FullLoadA<true>;
 using QuantL1Tile = GemmShape<128, 256, 512>;
 using QuantL0Tile = GemmShape<128, 256, 128>;
 using QuantA = Gemm::GemmType<int8_t, layout::RowMajor>;
@@ -828,8 +1300,10 @@ using QuantBlockEpilogue = Epilogue::Block::BlockEpilogue<
     QuantEpilogueDispatch, QuantC, QuantScale, QuantTokenScale, QuantD,
     QuantTileRowMul, QuantTileOneBlock, QuantTileColumnMul, QuantEpilogueCopy,
     QuantTileScheduler>;
-using QuantScheduler = Gemm::Block::GemmIdentityBlockSwizzle<3, 0>;
-using QuantMatmul = Gemm::Kernel::QuantMatmulMultiStageWorkspace<
+// F13: Zn order with offset 1 keeps each core's consecutive tiles inside one M
+// row, so the full-load-A block can skip the GM->L1 A copy (needLoadL1).
+using QuantScheduler = Gemm::Block::GemmIdentityBlockSwizzleL1FullLoad<1, 0>;
+using QuantMatmul = QuantMatmulFullLoadAWorkspace<
     QuantBlockMmad, QuantBlockEpilogue, QuantScheduler, kWorkspaceStages>;
 
 struct RopeScatterKernel {
@@ -841,14 +1315,27 @@ struct RopeScatterKernel {
         GM_ADDR slots;
         GM_ADDR cache;
         uint32_t t;
+        // Local Q head count: qOutput is [t, headNum, kHeadDim].
+        uint32_t headNum;
+        // true (default): scatter the computed row into `cache` at the row
+        // named by `slots` (fused behavior; `kvOut` is never written).
+        // false: write the same [t,kHeadDim] BF16 row to the fresh `kvOut`
+        // output and NEVER read `slots` or read/write `cache`. The Q branch is
+        // unchanged in both modes.
+        bool updateKvCache;
+        GM_ADDR kvOut;
     };
     using Arguments = Params;
 
     static bool CanImplement(const Arguments &args)
     {
         return args.qOutput != nullptr && args.kv != nullptr && args.ropeCos != nullptr &&
-            args.ropeSin != nullptr && args.slots != nullptr && args.cache != nullptr &&
-            args.t > 0 && args.t <= kMaxT;
+            args.ropeSin != nullptr &&
+            (args.updateKvCache
+                 ? args.slots != nullptr && args.cache != nullptr
+                 : args.kvOut != nullptr) &&
+            args.t > 0 && args.t <= kMaxT &&
+            args.headNum >= kMinHeads && args.headNum <= kMaxHeads;
     }
 
     static size_t GetWorkspaceSize(const Arguments &)
@@ -886,9 +1373,20 @@ struct RopeScatterKernel {
         constexpr uint32_t kSin = 9216;
         constexpr uint32_t kSign = 10240;
         constexpr uint32_t kOffsets = 11264;
-        // Whole-token staging for the kHeads x kRopeDim rope slices: one strided
-        // descriptor per token instead of one per 4-head batch. 64 * 64 * 2 = 8192 B.
+        // Whole-token staging for the headNum x kRopeDim rope slices: one
+        // strided descriptor per token instead of one per 4-head batch. The
+        // staging capacity stays at the 64-head bound even when headNum < 64:
+        // kMaxHeads * kRopeDim * sizeof(bfloat16_t) = 8192 B.
         constexpr uint32_t kQRows = 12288;
+        // Staged Q-rope buffers: the headCount/4 per-batch iterations are
+        // independent, so each dependency stage is issued for all heads back
+        // to back and only one PipeBarrier per stage is paid. Capacity is the
+        // kMaxHeads * kRopeDim = 4096 element bound (16 KiB per fp32 buffer).
+        // Pure scheduling change: per element the Cast/Mul/Gather/
+        // FusedMulAdd/Cast chain and its operands are unchanged.
+        constexpr uint32_t kXAll = 20480;
+        constexpr uint32_t kOutAll = kXAll + kMaxHeads * kRopeDim * sizeof(float);
+        constexpr uint32_t kRotAll = kOutAll + kMaxHeads * kRopeDim * sizeof(float);
 
         Arch::Resource<Arch::AtlasA2> resource;
         AscendC::LocalTensor<bfloat16_t> rowLocal[2] = {
@@ -908,6 +1406,9 @@ struct RopeScatterKernel {
         auto sign = resource.ubBuf.GetBufferByByte<float>(kSign);
         auto offsets = resource.ubBuf.GetBufferByByte<uint32_t>(kOffsets);
         auto qRows = resource.ubBuf.GetBufferByByte<bfloat16_t>(kQRows);
+        auto xAll = resource.ubBuf.GetBufferByByte<float>(kXAll);
+        auto outAll = resource.ubBuf.GetBufferByByte<float>(kOutAll);
+        auto rotAll = resource.ubBuf.GetBufferByByte<float>(kRotAll);
 
         AscendC::GlobalTensor<bfloat16_t> gmQ;
         AscendC::GlobalTensor<bfloat16_t> gmKv;
@@ -915,12 +1416,20 @@ struct RopeScatterKernel {
         AscendC::GlobalTensor<float> gmSin;
         AscendC::GlobalTensor<int32_t> gmSlots;
         AscendC::GlobalTensor<bfloat16_t> gmCache;
+        AscendC::GlobalTensor<bfloat16_t> gmKvOut;
         gmQ.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.qOutput));
         gmKv.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.kv));
         gmCos.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.ropeCos));
         gmSin.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(params.ropeSin));
-        gmSlots.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.slots));
-        gmCache.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.cache));
+        if (params.updateKvCache) {
+            // Fused mode: `slots`/`cache` are the only KV write target.
+            gmSlots.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.slots));
+            gmCache.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.cache));
+        } else {
+            // Diagnostic mode: `slots`/`cache` are never bound, so neither the
+            // slot scalars nor any cache row can be read or written.
+            gmKvOut.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(params.kvOut));
+        }
 
         auto *pipe = GetTPipePtr();
         const int32_t inputReady[2] = {
@@ -949,6 +1458,7 @@ struct RopeScatterKernel {
         const uint32_t blockNum =
             AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
         for (uint32_t token = blockIdx; token < params.t; token += blockNum) {
+            const uint32_t headCount = params.headNum;
             const uint64_t ropeOffset = static_cast<uint64_t>(token) * kRopeDim;
             for (uint32_t batch = 0; batch < kHeadBatch; ++batch) {
                 AscendC::DataCopy(
@@ -956,8 +1466,9 @@ struct RopeScatterKernel {
                 AscendC::DataCopy(
                     sin[batch * kRopeDim], gmSin[ropeOffset], kRopeDim);
             }
-            // One strided descriptor per token for all kHeads rope slices
-            // (was: kHeads/kHeadBatch = 16 descriptors of 4 rows each).
+            // One strided descriptor per token for all headCount rope slices
+            // (was: headCount/kHeadBatch descriptors of 4 rows each). The
+            // descriptor shrinks with headCount; staging capacity is unchanged.
             // slotFree[1]/pending[1] guard this staging buffer (slot 1 is no
             // longer used by the per-batch row buffer).
             if (pending[1]) {
@@ -965,39 +1476,52 @@ struct RopeScatterKernel {
                 pending[1] = false;
             }
             const uint64_t qRopeOffset =
-                static_cast<uint64_t>(token) * kHeads * kHeadDim + kNopeDim;
+                static_cast<uint64_t>(token) * headCount * kHeadDim + kNopeDim;
             AscendC::DataCopy(
                 qRows, gmQ[qRopeOffset],
-                AscendC::DataCopyParams(kHeads, 4U, 28U, 0U));
+                AscendC::DataCopyParams(headCount, 4U, 28U, 0U));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(inputReady[0]);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(inputReady[0]);
             AscendC::Mul(sin, sin, sign, kBatchRope);
             AscendC::PipeBarrier<PIPE_V>();
 
-            for (uint32_t head = 0; head < kHeads; head += kHeadBatch) {
-                const uint32_t slot = (head / kHeadBatch) & 1U;
-                AscendC::LocalTensor<bfloat16_t> rows =
-                    qRows[(head / kHeadBatch) * kBatchRope];
-
-                AscendC::Cast(
-                    x[slot], rows,
-                    AscendC::RoundMode::CAST_NONE, kBatchRope);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Mul(output[slot], x[slot], cos, kBatchRope);
-                AscendC::Gather(rotated[slot], x[slot], offsets, 0U, kBatchRope);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::FusedMulAdd(
-                    rotated[slot], sin, output[slot], kBatchRope);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Cast(
-                    rows, rotated[slot],
-                    AscendC::RoundMode::CAST_RINT, kBatchRope);
+            // Q rope with one level-2 Cast and one level-0 broadcast
+            // Mul/FusedMulAdd over all heads (srcRepStride=0 reuses the
+            // token's 64 cos/sin values), and a per-4-head level-2 Gather
+            // (the level-0 Gather with a 64-repeat body is not usable on
+            // this device). API calls per token drop from 80 to 2 + 16 + 2.
+            const uint32_t ropeCount = headCount * kRopeDim;
+            const uint64_t ropeMask = kRopeDim;
+            const uint8_t headRepeats = static_cast<uint8_t>(headCount);
+            const uint16_t dstRepFp32 = 8U;
+            AscendC::BinaryRepeatParams mulParams(
+                1, 1, 1, dstRepFp32, dstRepFp32, 0);
+            AscendC::BinaryRepeatParams fmaParams(
+                1, 1, 1, dstRepFp32, 0, dstRepFp32);
+            AscendC::Cast(
+                xAll, qRows, AscendC::RoundMode::CAST_NONE, ropeCount);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mul(
+                outAll, xAll, cos, ropeMask, headRepeats, mulParams);
+            for (uint32_t head = 0; head < headCount; head += kHeadBatch) {
+                const uint32_t batch = head / kHeadBatch;
+                const uint32_t batchHeads =
+                    (headCount - head < kHeadBatch) ? headCount - head : kHeadBatch;
+                const uint32_t count = batchHeads * kRopeDim;
+                const uint32_t base = batch * kBatchRope;
+                AscendC::Gather(rotAll[base], xAll[base], offsets, 0U, count);
             }
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::FusedMulAdd(
+                rotAll, sin, outAll, ropeMask, headRepeats, fmaParams);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(
+                qRows, rotAll, AscendC::RoundMode::CAST_RINT, ropeCount);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::DataCopy(
                 gmQ[qRopeOffset], qRows,
-                AscendC::DataCopyParams(kHeads, 4U, 0U, 28U));
+                AscendC::DataCopyParams(headCount, 4U, 0U, 28U));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(slotFree[1]);
             pending[1] = true;
 
@@ -1025,15 +1549,22 @@ struct RopeScatterKernel {
                 AscendC::RoundMode::CAST_RINT, kRopeDim);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vMte3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vMte3);
-            const int32_t page =
-                gmSlots.GetValue(static_cast<uint64_t>(token) * 2U);
-            const int32_t row =
-                gmSlots.GetValue(static_cast<uint64_t>(token) * 2U + 1U);
-            const uint64_t cacheRow =
-                static_cast<uint64_t>(page) * kCacheRowsPerPage +
-                static_cast<uint32_t>(row);
-            AscendC::DataCopy(
-                gmCache[cacheRow * kHeadDim], rowLocal[kvSlot], kHeadDim);
+            if (params.updateKvCache) {
+                const int32_t page =
+                    gmSlots.GetValue(static_cast<uint64_t>(token) * 2U);
+                const int32_t row =
+                    gmSlots.GetValue(static_cast<uint64_t>(token) * 2U + 1U);
+                const uint64_t cacheRow =
+                    static_cast<uint64_t>(page) * kCacheRowsPerPage +
+                    static_cast<uint32_t>(row);
+                AscendC::DataCopy(
+                    gmCache[cacheRow * kHeadDim], rowLocal[kvSlot], kHeadDim);
+            } else {
+                // Same bytes the fused path scatters into the cache row,
+                // written to the fresh [t, kHeadDim] output instead. No slot
+                // read and no cache access happen in this branch.
+                AscendC::DataCopy(gmKvOut[kvOffset], rowLocal[kvSlot], kHeadDim);
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(slotFree[kvSlot]);
             pending[kvSlot] = true;
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vMte2);
@@ -1098,7 +1629,12 @@ struct UnifiedMlaPrologKernel {
     {
         DualProjectionKernel projection;
         projection.template operator()<AscendC::AIC>(params.projection);
-        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(projectionReady);
+        // On the E1/F21 pipeline path S1 is gated per chunk instead, so the
+        // single global announcement would be an unconsumed set (flag depth).
+        if (!E1PipelineOn(params.projection.projectionSplits,
+                          params.projection.qaShape.m(), params.projection.narrowM)) {
+            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(projectionReady);
+        }
 
         Arch::CrossCoreWaitFlag(normReady);
         quantMatmul.template operator()<AscendC::AIC>(params.quantMatmul);

@@ -22,9 +22,14 @@ namespace ops {
 constexpr size_t X_INPUT_INDEX = 0;
 constexpr size_t Q_OUTPUT_INDEX = 0;
 constexpr size_t QR_OUTPUT_INDEX = 1;
-constexpr uint32_t HEADS = 64;
+constexpr size_t KV_OUTPUT_INDEX = 2;
+constexpr size_t HEAD_NUM_ATTR_INDEX = 1;
+constexpr int64_t DEFAULT_HEAD_NUM = 64;
+constexpr int64_t MIN_HEAD_NUM = 1;
+constexpr int64_t MAX_HEAD_NUM = 64;
 constexpr uint32_t HEAD_DIM = 512;
 constexpr uint32_t Q_LORA = 1280;
+constexpr uint32_t KV_LORA = 512;
 
 ge::graphStatus InferShapeMlaProlog(gert::InferShapeContext *context)
 {
@@ -35,17 +40,39 @@ ge::graphStatus InferShapeMlaProlog(gert::InferShapeContext *context)
         OP_LOGE(context->GetNodeName(), "x must be rank-2");
         return ge::GRAPH_FAILED;
     }
+    // q_head_num is the local Q head count for TP sharding; q_output is
+    // [T, q_head_num, 512] and qr stays [T, 1280] (Q-LoRA is not sharded).
+    int64_t headNum = DEFAULT_HEAD_NUM;
+    auto attrs = context->GetAttrs();
+    if (attrs != nullptr) {
+        const int64_t *heads = attrs->GetAttrPointer<int64_t>(HEAD_NUM_ATTR_INDEX);
+        if (heads != nullptr) {
+            headNum = *heads;
+        }
+    }
+    if (headNum < MIN_HEAD_NUM || headNum > MAX_HEAD_NUM) {
+        OP_LOGE(context->GetNodeName(), "q_head_num must be in [1, 64]");
+        return ge::GRAPH_FAILED;
+    }
     gert::Shape *qShape = context->GetOutputShape(Q_OUTPUT_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, qShape);
     qShape->SetDimNum(3);
     qShape->SetDim(0, xShape->GetDim(0));
-    qShape->SetDim(1, HEADS);
+    qShape->SetDim(1, headNum);
     qShape->SetDim(2, HEAD_DIM);
     gert::Shape *qrShape = context->GetOutputShape(QR_OUTPUT_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, qrShape);
     qrShape->SetDimNum(2);
     qrShape->SetDim(0, xShape->GetDim(0));
     qrShape->SetDim(1, Q_LORA);
+    // kv is the [T, 512] row the fused path writes into kv_cache. It is
+    // declared in both modes; with update_kv_cache=true the kernel does not
+    // write it, with false it is the only KV write target.
+    gert::Shape *kvShape = context->GetOutputShape(KV_OUTPUT_INDEX);
+    OP_CHECK_NULL_WITH_CONTEXT(context, kvShape);
+    kvShape->SetDimNum(2);
+    kvShape->SetDim(0, xShape->GetDim(0));
+    kvShape->SetDim(1, KV_LORA);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -54,6 +81,7 @@ ge::graphStatus InferDataTypeMlaProlog(gert::InferDataTypeContext *context)
     OP_CHECK_NULL_WITH_CONTEXT(context, context);
     context->SetOutputDataType(Q_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
     context->SetOutputDataType(QR_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
+    context->SetOutputDataType(KV_OUTPUT_INDEX, context->GetInputDataType(X_INPUT_INDEX));
     return ge::GRAPH_SUCCESS;
 }
 

@@ -37,9 +37,15 @@ CATLASS_DEVICE void MlaPrologDevice(
     GM_ADDR x, GM_ADDR wQa, GM_ADDR gammaQa, GM_ADDR wQb, GM_ADDR wQbScale,
     GM_ADDR wKv, GM_ADDR gammaKv, GM_ADDR ropeCos, GM_ADDR ropeSin,
     GM_ADDR slotIndices, GM_ADDR kvCache, GM_ADDR qOutput, GM_ADDR qr,
-    GM_ADDR userWorkspace, const __gm__ TilingData *tilingData)
+    GM_ADDR kvOutput, GM_ADDR userWorkspace, const __gm__ TilingData *tilingData)
 {
     const uint32_t t = tilingData->t;
+    // Local Q head count for this TP shard (1..64); the host tiler validated it
+    // against w_qb/w_qb_scale shapes. Q-B output channels N = headNum*512.
+    const uint32_t headNum = tilingData->headNum;
+    // false: the KV branch writes the fresh kv output and never touches
+    // kv_cache or slot_indices; true keeps the fused in-place scatter.
+    const bool updateKvCache = tilingData->updateKvCache != 0U;
     GM_ADDR qa = userWorkspace + tilingData->qaOffset;
     GM_ADDR kv = userWorkspace + tilingData->kvOffset;
     GM_ADDR kvNorm = userWorkspace + tilingData->kvNormOffset;
@@ -60,15 +66,17 @@ CATLASS_DEVICE void MlaPrologDevice(
     // OpDef attribute is parsed by host tiling and read here.
     Dsv41::NormQuantKernel::Arguments normArgs{
         qa, kv, kvNorm, gammaQa, gammaKv, qInt8, qScale, wQbScale, wScaleFp,
-        t, tilingData->projectionSplits, qr, tilingData->rmsNormEps};
+        t, tilingData->projectionSplits, tilingData->narrowM, qr,
+        tilingData->rmsNormEps, headNum};
     Dsv41::RopeScatterKernel::Arguments ropeArgs{
-        qOutput, kvNorm, ropeCos, ropeSin, slotIndices, kvCache, t};
+        qOutput, kvNorm, ropeCos, ropeSin, slotIndices, kvCache, t, headNum,
+        updateKvCache, kvOutput};
 
     // QuantMatmul::Arguments stores generic uint8_t*; building its Params
     // directly keeps the __gm__ address space of the device entry and matches
     // the CATLASS Params layout without a host-only conversion.
     using Quant = Dsv41::QuantMatmul;
-    const uint32_t m = t, n = Dsv41::kQbOut, k = Dsv41::kQa;
+    const uint32_t m = t, n = headNum * Dsv41::kHeadDim, k = Dsv41::kQa;
     Quant::Params quantParams{};
     quantParams.problemShape = GemmCoord(m, n, k);
     quantParams.ptrA = reinterpret_cast<__gm__ Quant::ElementA *>(qInt8);
@@ -95,7 +103,7 @@ extern "C" __global__ __aicore__ void fi_mla_prolog(
     GM_ADDR x, GM_ADDR wQa, GM_ADDR gammaQa, GM_ADDR wQb, GM_ADDR wQbScale,
     GM_ADDR wKv, GM_ADDR gammaKv, GM_ADDR ropeCos, GM_ADDR ropeSin,
     GM_ADDR slotIndices, GM_ADDR kvCache, GM_ADDR qOutput, GM_ADDR qr,
-    GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR kvOutput, GM_ADDR workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     REGISTER_TILING_DEFAULT(MlaPrologTilingData);
@@ -104,14 +112,21 @@ extern "C" __global__ __aicore__ void fi_mla_prolog(
     }
     AscendC::SetSysWorkspace(workspace);
     auto *data = reinterpret_cast<__gm__ MlaPrologTilingData *>(tiling);
-    if (data->version != 2 || data->t < 1 || data->t > Dsv41::kMaxT ||
+    if (data->version != 4 || data->t < 1 || data->t > Dsv41::kMaxT ||
         data->aicNum == 0 || data->hardwareSyncAddr == 0 ||
+        data->headNum < Dsv41::kMinHeads || data->headNum > Dsv41::kMaxHeads ||
+        data->updateKvCache > 1U ||
         !(data->rmsNormEps > 0.0F)) {
+        return;
+    }
+    // The kv output is the only KV write target when the fused cache scatter
+    // is disabled, so a missing pointer must not silently drop the row.
+    if (data->updateKvCache == 0U && kvOutput == nullptr) {
         return;
     }
     AscendC::SetSyncBaseAddr(data->hardwareSyncAddr);
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
     MlaPrologDevice<MlaPrologTilingData>(
         x, wQa, gammaQa, wQb, wQbScale, wKv, gammaKv, ropeCos, ropeSin,
-        slotIndices, kvCache, qOutput, qr, userWorkspace, data);
+        slotIndices, kvCache, qOutput, qr, kvOutput, userWorkspace, data);
 }

@@ -729,10 +729,7 @@ typedef void (*ReleaseHugeMem)(void *, bool);
       TORCH_CHECK(ret == 0, #aclnn_api " launch returned ", ret, ": ", aclGetRecentErrMsg());\
       return ret;                                                                     \
     };                                                                                \
-    at_npu::native::OpCommand cmd;                                                    \
-    cmd.Name(#aclnn_api);                                                             \
-    cmd.SetCustomHandler(acl_call);                                                   \
-    cmd.Run();                                                                        \
+    at_npu::native::OpCommand::RunOpApiV2(#aclnn_api, acl_call);                      \
   } while (false)
 
 #endif

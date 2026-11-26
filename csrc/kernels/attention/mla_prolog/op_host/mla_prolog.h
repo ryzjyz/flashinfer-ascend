@@ -31,6 +31,16 @@ struct Dsv41MlaPrologArguments {
     uint16_t *qr;
     // FP32 RMSNorm epsilon for both branches; finite and > 0, default 1e-6.
     float rmsNormEps;
+    // Local Q head count in [1,64] (default 64) for TP sharding; qOutput is
+    // [t, headNum, 512] and wQb/wQbScale describe headNum*512 channels.
+    int32_t headNum;
+    // Fresh BF16 [t,512] KV row. Written only when updateKvCache is false;
+    // when true the fused path writes kvCache and leaves kvOut untouched.
+    uint16_t *kvOut;
+    // true (default): scatter the KV row into kvCache at slotIndices.
+    // false: write the same row to kvOut and never read slotIndices or
+    // read/write kvCache (both may be null in that mode).
+    bool updateKvCache;
 };
 
 uint64_t GetDsv41MlaPrologWorkspaceSize(const Dsv41MlaPrologArguments &args);

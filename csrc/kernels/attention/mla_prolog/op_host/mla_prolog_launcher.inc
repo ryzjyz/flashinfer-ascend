@@ -27,7 +27,9 @@
 
 uint64_t GetDsv41MlaPrologWorkspaceSize(const Dsv41MlaPrologArguments &args)
 {
-    if (args.t <= 0 || args.t > static_cast<int32_t>(Dsv41::kMaxT)) {
+    if (args.t <= 0 || args.t > static_cast<int32_t>(Dsv41::kMaxT) ||
+        args.headNum < static_cast<int32_t>(Dsv41::kMinHeads) ||
+        args.headNum > static_cast<int32_t>(Dsv41::kMaxHeads)) {
         return 0;
     }
     auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
@@ -35,7 +37,8 @@ uint64_t GetDsv41MlaPrologWorkspaceSize(const Dsv41MlaPrologArguments &args)
         return 0;
     }
     return Dsv41::MakeWorkspaceLayout(
-        static_cast<uint32_t>(args.t), platform->GetCoreNumAic()).totalBytes;
+        static_cast<uint32_t>(args.t), platform->GetCoreNumAic(),
+        static_cast<uint32_t>(args.headNum)).totalBytes;
 }
 
 aclError Dsv41MlaProlog(
@@ -45,9 +48,14 @@ aclError Dsv41MlaProlog(
     if (args.x == nullptr || args.wQa == nullptr || args.gammaQa == nullptr ||
         args.wQb == nullptr || args.wQbScale == nullptr || args.wKv == nullptr ||
         args.gammaKv == nullptr || args.ropeCos == nullptr || args.ropeSin == nullptr ||
-        args.slotIndices == nullptr || args.kvCache == nullptr || args.qOutput == nullptr ||
+        (args.updateKvCache
+             ? args.slotIndices == nullptr || args.kvCache == nullptr
+             : args.kvOut == nullptr) ||
+        args.qOutput == nullptr ||
         args.qr == nullptr || !std::isfinite(args.rmsNormEps) ||
         !(args.rmsNormEps > 0.0F) ||
+        args.headNum < static_cast<int32_t>(Dsv41::kMinHeads) ||
+        args.headNum > static_cast<int32_t>(Dsv41::kMaxHeads) ||
         args.workspace == nullptr || stream == nullptr || args.t <= 0 ||
         args.t > static_cast<int32_t>(Dsv41::kMaxT)) {
         return ACL_ERROR_INVALID_PARAM;
@@ -62,8 +70,9 @@ aclError Dsv41MlaProlog(
     if (aicCount == 0 || aivCount == 0 || aivCount != 2U * aicCount) {
         return ACL_ERROR_INTERNAL_ERROR;
     }
+    const uint32_t headNum = static_cast<uint32_t>(args.headNum);
     const auto workspace = Dsv41::MakeWorkspaceLayout(
-        static_cast<uint32_t>(args.t), aicCount);
+        static_cast<uint32_t>(args.t), aicCount, headNum);
     if (args.workspaceSize < workspace.totalBytes) {
         return ACL_ERROR_INVALID_PARAM;
     }
@@ -115,8 +124,10 @@ aclError Dsv41MlaProlog(
         static_cast<uint32_t>(args.t),
         projectionSplits,
         reinterpret_cast<uint8_t *>(args.qr),
-        args.rmsNormEps};
-    const GemmCoord quantShape(static_cast<uint32_t>(args.t), Dsv41::kQbOut, Dsv41::kQa);
+        args.rmsNormEps,
+        headNum};
+    const GemmCoord quantShape(
+        static_cast<uint32_t>(args.t), headNum * Dsv41::kHeadDim, Dsv41::kQa);
     Dsv41::QuantMatmul::Arguments quantArgs{
         quantShape,
         aicCount,
@@ -132,7 +143,10 @@ aclError Dsv41MlaProlog(
         reinterpret_cast<uint8_t *>(const_cast<float *>(args.ropeSin)),
         reinterpret_cast<uint8_t *>(const_cast<int32_t *>(args.slotIndices)),
         reinterpret_cast<uint8_t *>(args.kvCache),
-        static_cast<uint32_t>(args.t)};
+        static_cast<uint32_t>(args.t),
+        headNum,
+        args.updateKvCache,
+        reinterpret_cast<uint8_t *>(args.kvOut)};
     Dsv41::UnifiedMlaPrologKernel::Arguments unifiedArgs{
         projectionArgs,
         normArgs,

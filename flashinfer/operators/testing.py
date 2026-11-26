@@ -21,6 +21,21 @@ def _outputs(result, count):
     return outputs
 
 
+def case_output_count(operator, cases, configuration):
+    """Public output count for one case; operators may vary it per case.
+
+    ``TOLERANCES`` keeps one entry per declared output. An optional
+    ``cases.output_count(configuration)`` hook opts into per-case subsets (for
+    example an optional diagnostic output); everything else keeps the fixed
+    one-output-per-declared-name contract.
+    """
+    declared = len(cases.TOLERANCES)
+    if not declared or (operator.schema and declared != len(operator.output_names)):
+        raise AssertionError("numerical cases and output tolerances must be explicit and nonempty")
+    counter = getattr(cases, "output_count", None)
+    return declared if counter is None else int(counter(configuration))
+
+
 def vendor_directory(match, aliases):
     vendor = match.directory / "packages" / "vendors" / match.recipe.package_vendor
     if "." not in str(vendor):
@@ -97,10 +112,6 @@ def numerical_cases(torch, torch_npu, name, *, first_only=False, kernel_id=None,
     cases = cases_module(name)
     parameters = case_parameters(cases, kernel_id)
     void_mutation = is_void_mutation(operator)
-    output_count = 0 if void_mutation else len(cases.TOLERANCES)
-    if not void_mutation and (
-            not output_count or (operator.schema and output_count != len(operator.output_names))):
-        raise AssertionError("numerical cases and output tolerances must be explicit and nonempty")
     call = public_function(name)
     observations = {}
     for index, configuration in enumerate(parameters[:1] if first_only else parameters):
@@ -112,6 +123,7 @@ def numerical_cases(torch, torch_npu, name, *, first_only=False, kernel_id=None,
             observations[str(index)] = dict(case=configuration, max_abs=errors)
             continue
         tolerances = case_tolerances(cases, configuration)
+        output_count = case_output_count(operator, cases, configuration)
         originals = tuple(t for t in tuple(args) + tuple(options.values()) if isinstance(t, torch.Tensor))
         pointers = tuple(t.data_ptr() for t in originals)
         expected = _outputs(expected, output_count)

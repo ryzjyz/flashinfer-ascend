@@ -23,14 +23,22 @@
 #include <cstdint>
 
 struct MlaPrologTilingData {
-    // Layout version 2 adds the rms_norm_eps attribute scalar. The device
-    // entry rejects any other version so a stale host/device pair cannot
+    // Layout version 4 adds the update_kv_cache attribute. The device entry
+    // rejects any other version so a stale host/device pair cannot
     // misinterpret the payload.
     uint32_t version;
     uint32_t t;
     uint32_t aicNum;
     uint32_t projectionSplits;
     uint32_t narrowM;
+    // Local Q head count in [1,64] (TP shard size); Q-B output channels are
+    // headNum * 512 and q_output is [t, headNum, 512].
+    uint32_t headNum;
+    // 1 (default): scatter the computed KV row into kv_cache (fused behavior).
+    // 0: write it to the fresh [t,512] kv output and never read slot_indices
+    // or read/write kv_cache. A tiling scalar, not a device-side OpDef
+    // attribute, because the kernel ABI forwards only tensors + tiling.
+    uint32_t updateKvCache;
     // FP32 RMSNorm epsilon parsed from the rms_norm_eps OpDef attribute;
     // applied to both the Q and KV branches. Always finite and > 0.
     float rmsNormEps;
