@@ -54,11 +54,29 @@ class Operands {
         }
         return {lo, lo + elements * tensor.element_size()};
     }
+    // Upstream overlap semantics: logical byte span for ND, full storage for NZ.
+    static std::pair<uintptr_t, uintptr_t> legacy_range(const at::Tensor& tensor) {
+        const bool nz = at_npu::native::get_npu_format(tensor) == ACL_FORMAT_FRACTAL_NZ;
+        const auto lo = reinterpret_cast<uintptr_t>(nz ? tensor.storage().data() : tensor.data_ptr());
+        return {lo, lo + (nz ? tensor.storage().nbytes() : tensor.nbytes())};
+    }
 public:
     const std::shared_ptr<Owners> keepalive;
-    explicit Operands(const Call& c) : inputs_(c.inputs), outputs_(c.outputs),
+    explicit Operands(const Call& c, bool early_overlap = true) : inputs_(c.inputs), outputs_(c.outputs),
             original_inputs_(c.inputs), original_outputs_(c.outputs), widths_(c.widths),
-            lists_(!c.widths.empty()), keepalive(std::make_shared<Owners>(c)) {}
+            lists_(!c.widths.empty()), keepalive(std::make_shared<Owners>(c)) {
+        if (!early_overlap) return;
+        for (size_t i = 0; i < c.outputs.size(); ++i) {
+            const auto& out = c.outputs[i];
+            auto overlaps = [&](const at::Tensor& t) {
+                if (t.device() != out.device()) return false;
+                auto a = legacy_range(out), b = legacy_range(t);
+                return std::max(a.first, b.first) < std::min(a.second, b.second);
+            };
+            for (const auto& t : c.inputs) TORCH_CHECK(!overlaps(t), "ACLNN output tensors must not overlap other arguments");
+            for (size_t j = 0; j < i; ++j) TORCH_CHECK(!overlaps(c.outputs[j]), "ACLNN outputs must not overlap");
+        }
+    }
 
     // Rich mutation operators pass the same cache view as an input and output.
     // Register the exact pair before consuming operands; all other overlap is
@@ -82,7 +100,7 @@ public:
 
     // -1 is an absent optional argument. Zero is a present empty TensorList.
     c10::optional<at::TensorList> take(bool output, bool list, bool optional, int layouts,
-                                      bool cpu, bool strided_alias) {
+                                      bool cpu, bool strided_alias, bool nz_orientation) {
         auto& source = output ? outputs_ : inputs_;
         const size_t position = output ? output_position_++ : input_position_++;
         TORCH_CHECK(strided_alias == declared_alias(output, position),
@@ -103,8 +121,13 @@ public:
                 TORCH_CHECK(tensor.device().is_cpu(), "Expected a declared CPU tensor");
                 continue;
             }
-            TORCH_CHECK(tensor.device() == stream_.device(),
-                        "ACLNN tensor violates its declared device/format");
+            if (!strided_alias) {
+                TORCH_CHECK(tensor.device() == stream_.device() && tensor.is_contiguous(),
+                            "ACLNN tensor violates its declared device/format");
+            } else {
+                TORCH_CHECK(tensor.device() == stream_.device(),
+                            "ACLNN tensor violates its declared device/format");
+            }
             const auto format = at_npu::native::get_npu_format(tensor);
             const int mask = format == ACL_FORMAT_ND ? 1 : format == ACL_FORMAT_FRACTAL_NZ ? 2 : 0;
             TORCH_CHECK(layouts & mask, "ACLNN tensor violates its declared device/format");
@@ -127,11 +150,8 @@ public:
                 TORCH_CHECK(span >= 0 && static_cast<uint64_t>(span) <
                             static_cast<uint64_t>(tensor.storage().nbytes() / tensor.element_size()),
                             "ACLNN strided alias exceeds its storage span");
-            } else {
-                TORCH_CHECK(tensor.is_contiguous(),
-                            "ACLNN tensor violates its declared device/format");
             }
-            if (format == ACL_FORMAT_FRACTAL_NZ && tensor.dim() == 2 &&
+            if (nz_orientation && format == ACL_FORMAT_FRACTAL_NZ && tensor.dim() == 2 &&
                 tensor.scalar_type() == at::kChar) {
                 // INT8 NZ is physically [ceil(N/32), ceil(M/16), 16, 32].
                 // Reject a transposed backing with the wrong logical orientation.
@@ -159,6 +179,8 @@ public:
     }
     void finish() const {
         TORCH_CHECK(inputs_.empty() && outputs_.empty() && widths_.empty(), "Extra ACLNN operands");
+        // Non-alias packages already ran the upstream overlap check at construction.
+        if (aliases_.empty()) return;
         for (size_t out = 0; out < original_outputs_.size(); ++out) {
             const auto& target = original_outputs_[out];
             auto overlaps = [&](const at::Tensor& other) {

@@ -32,7 +32,7 @@ def direct_operator_binding(operator, capability, backend, kernel_id):
 def rich_operator_binding(operator, capability, backend, kernel_id):
     """Bind a rich public_entry operator that owns its mutation schema."""
     contract = getattr(operator, "torch_contract", ())
-    if operator.schema or operator.public_entry is None or capability.op != operator.op:
+    if not contract or operator.schema or operator.public_entry is None or capability.op != operator.op:
         raise SchemaError("rich capability binding requires a public_entry operator")
     payload = dict(
         public_entry=operator.public_entry,
@@ -56,11 +56,11 @@ def validate_direct_operator_binding(descriptor):
         raise SchemaError("direct operator requires its capability binding")
     operator = definition(descriptor.op)
     expected = (
-        direct_operator_binding(operator, descriptor.capability,
-                                descriptor.backend, descriptor.kernel_id)
-        if operator.schema or operator.torch_declarations is not None else
         rich_operator_binding(operator, descriptor.capability,
                               descriptor.backend, descriptor.kernel_id)
+        if operator.torch_contract else
+        direct_operator_binding(operator, descriptor.capability,
+                                descriptor.backend, descriptor.kernel_id)
     )
     if binding != expected:
         raise SchemaError("direct operator capability/schema binding mismatch")

@@ -97,6 +97,8 @@ class TensorParameter:
     # Additive exact-alias declaration for mutation-only outputs. The named
     # input and this output must share one storage view and independent strides.
     alias_of: Optional[str] = None
+    # Opt-in INT8 2-D NZ storage-orientation guard for caller-supplied weights.
+    nz_orientation: bool = False
     tensor_list: bool = False
     device: str = "npu"
 
@@ -144,6 +146,12 @@ class TensorParameter:
                 self.role != "output" or not isinstance(self.alias_of, str)
                 or not _SYMBOL.fullmatch(self.alias_of)):
             raise SchemaError("Tensor alias_of must name an input for an output parameter")
+        if type(self.nz_orientation) is not bool:
+            raise SchemaError("Tensor nz_orientation must be a bool")
+        if self.nz_orientation and (
+                self.role != "input" or self.dtype != "int8" or len(self.shape) != 2
+                or "NZ" not in layouts):
+            raise SchemaError("Tensor nz_orientation requires a 2-D INT8 NZ input")
 
     def native_type(self, storage_dtype):
         return next((c.native_dtype for c in self.native_conversions if c.storage_dtype == storage_dtype), storage_dtype)
@@ -153,7 +161,8 @@ class TensorParameter:
         for name, default in (("optional", False), ("physical_layouts", ("ND",)),
                               ("shape_alternatives", ()), ("native_conversions", ()),
                               ("optional_for_dtypes", ()), ("alias_of", None),
-                              ("tensor_list", False), ("device", "npu")):
+                              ("nz_orientation", False), ("tensor_list", False),
+                              ("device", "npu")):
             if getattr(self, name) == default:
                 value.pop(name)
         return value

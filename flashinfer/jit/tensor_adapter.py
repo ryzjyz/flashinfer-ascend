@@ -29,6 +29,21 @@ def _span(tensor):
 def _reject_output_overlap(parameters, tensors, aliases=None):
     """Reject output overlap unless the exact declared input alias is supplied."""
     aliases = aliases or {}
+    if not aliases:
+        # Upstream semantics for packages without exact aliases.
+        for output_index, (parameter, output) in enumerate(zip(parameters, tensors)):
+            if parameter.role != "output":
+                continue
+            out_lo = output.data_ptr()
+            out_hi = out_lo + output.numel() * output.element_size()
+            for tensor_index, tensor in enumerate(tensors):
+                if tensor_index == output_index or tensor is None:
+                    continue
+                lo = tensor.data_ptr()
+                hi = lo + tensor.numel() * tensor.element_size()
+                if max(lo, out_lo) < min(hi, out_hi):
+                    raise ValueError("output tensors must not overlap other arguments")
+        return
     for output_index, (parameter, output) in enumerate(zip(parameters, tensors)):
         if parameter.role != "output":
             continue

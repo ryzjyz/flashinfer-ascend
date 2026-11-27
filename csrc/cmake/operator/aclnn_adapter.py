@@ -94,22 +94,22 @@ def validate_device_entry(recipe, ops_info):
 
 def torch_call(recipe):
     """Generate the same C++ EXEC_NPU_CMD call an operator author would write."""
-    lines = [
-        '#include "aclnn_adapter.h"',
-        'using namespace flashinfer_aclnn;',
-        '#define FI_EXPORT extern "C" __attribute__((visibility("default")))',
-        'FI_EXPORT const char* fi_submit_identity() { return "' + fingerprint(recipe) + '"; }',
-        'FI_EXPORT void fi_submit(const Call& invocation) {',
-        '    Operands operands(invocation);',
-        '    TORCH_CHECK(invocation.attributes.size() == %d, "ACLNN attribute count mismatch");'
-        % len(recipe.get("attributes", ())),
-    ]
     params = recipe["tensor_parameters"]
     input_count = sum(p["role"] == "input" for p in params)
     indices = {p["name"]: i for i, p in enumerate(params)}
     aliases = tuple((indices[p["alias_of"]], i) for i, p in enumerate(params)
                     if p.get("alias_of") is not None)
     alias_operands = {index for pair in aliases for index in pair}
+    lines = [
+        '#include "aclnn_adapter.h"',
+        'using namespace flashinfer_aclnn;',
+        '#define FI_EXPORT extern "C" __attribute__((visibility("default")))',
+        'FI_EXPORT const char* fi_submit_identity() { return "' + fingerprint(recipe) + '"; }',
+        'FI_EXPORT void fi_submit(const Call& invocation) {',
+        '    Operands operands(invocation, %s);' % ('true' if not aliases else 'false'),
+        '    TORCH_CHECK(invocation.attributes.size() == %d, "ACLNN attribute count mismatch");'
+        % len(recipe.get("attributes", ())),
+    ]
     for source, output in aliases:
         lines.append(f'    operands.exact_alias({source}, {output - input_count});')
     arguments = []
@@ -121,7 +121,9 @@ def torch_call(recipe):
         flags = ", ".join(str(b).lower() for b in flags)
         cpu = str(param.get("device") == "cpu").lower()
         strided = str(i in alias_operands).lower()
-        lines.append(f'    auto t{i} = operands.take({flags}, {fmt}, {cpu}, {strided});')
+        nz_orientation = str(param.get("nz_orientation", False)).lower()
+        lines.append(
+            f'    auto t{i} = operands.take({flags}, {fmt}, {cpu}, {strided}, {nz_orientation});')
         if listed:
             value = f't{i}' if optional else f'*t{i}'
         elif optional:

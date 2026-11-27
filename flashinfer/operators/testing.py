@@ -84,8 +84,8 @@ def is_void_mutation(operator):
 
 
 def _implementation_options(operator, options, *, kernel_id=None, backend=None):
-    """Only schema-generated facades own out/backend/kernel_id routing arguments."""
-    if not operator.schema:
+    """Rich-contract facades own their public ABI; all others take routing arguments."""
+    if getattr(operator, "torch_contract", None):
         return dict(options)
     if kernel_id is not None:
         options = dict(options, kernel_id=kernel_id)
@@ -115,15 +115,18 @@ def numerical_cases(torch, torch_npu, name, *, first_only=False, kernel_id=None,
     call = public_function(name)
     observations = {}
     for index, configuration in enumerate(parameters[:1] if first_only else parameters):
-        args, options, expected = cases.sample(torch, torch_npu, **configuration)
-        options = _implementation_options(operator, options, kernel_id=kernel_id, backend=backend)
         if void_mutation:
+            args, options, expected = cases.sample(torch, torch_npu, **configuration)
+            options = _implementation_options(
+                operator, options, kernel_id=kernel_id, backend=backend)
             errors = run_void_mutation(torch, call, cases, args, options, expected)
             print(json.dumps(dict(case=configuration, max_abs=errors), sort_keys=True), flush=True)
             observations[str(index)] = dict(case=configuration, max_abs=errors)
             continue
         tolerances = case_tolerances(cases, configuration)
         output_count = case_output_count(operator, cases, configuration)
+        args, options, expected = cases.sample(torch, torch_npu, **configuration)
+        options = _implementation_options(operator, options, kernel_id=kernel_id, backend=backend)
         originals = tuple(t for t in tuple(args) + tuple(options.values()) if isinstance(t, torch.Tensor))
         pointers = tuple(t.data_ptr() for t in originals)
         expected = _outputs(expected, output_count)

@@ -55,8 +55,10 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
         tensors=(
             _tensor("qr", "input", "bfloat16", ("T", 1280)),
             _tensor("activation_q", "input", "int8", ("T", 1280)),
-            _tensor("weight_q", "input", "int8", (1280, 4096), ("NZ",)),
-            _tensor("wqb", "input", "int8", (1280, 4096), ("NZ",)),
+            TensorParameter(name="weight_q", role="input", dtype="int8", shape=(1280, 4096),
+                            physical_layouts=("NZ",), nz_orientation=True),
+            TensorParameter(name="wqb", role="input", dtype="int8", shape=(1280, 4096),
+                            physical_layouts=("NZ",), nz_orientation=True),
             _tensor("weight_scale", "input", "float32", (4096,)),
             _tensor("activation_scale", "input", "float32", ("T",)),
             _tensor("qb", "input", "bfloat16", ("T", 4096)),

@@ -160,7 +160,7 @@ class AscendCImplementation(ImplementationDefinition):
 
             metadata.setdefault("capability_binding", direct_operator_binding(
                 operator, capability, "ascendc", kernel_id))
-        elif operator.public_entry is not None:
+        elif operator.torch_contract:
             from flashinfer.operators.capability import rich_operator_binding
 
             metadata.setdefault("capability_binding", rich_operator_binding(
