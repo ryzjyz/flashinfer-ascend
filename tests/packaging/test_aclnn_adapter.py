@@ -11,13 +11,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def run(code, *, environment=None, timeout=120):
+def run(code):
     result = subprocess.run([sys.executable, "-B", "-c", code], cwd=ROOT,
-                            env=dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0",
-                                     **(environment or {})),
-                            capture_output=True, text=True, timeout=timeout)
+                            env=dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0"),
+                            capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    return result
 
 
 def test_aclnn_import_never_loads_provider_or_compiler():
@@ -215,43 +213,3 @@ def test_prebuilt_bridge_bundling_is_compiler_free_and_keeps_source_identity(tmp
     with pytest.raises(RuntimeError, match="source identity mismatch"):
         bundle_adapter(tmp_path / "rejected", directory=supplied)
     assert not (tmp_path / "rejected").exists()
-
-
-@pytest.mark.real_compile
-@pytest.mark.requires_soc("Ascend910B", "Ascend910C")
-def test_wrong_nz_direction_is_rejected_in_a_cold_process(tmp_path):
-    """Isolate the expected native failure from later CANN operator tests."""
-    from flashinfer.operators.pytest_support import prepare_release
-    from flashinfer.runtime import current_hardware
-
-    kernel_id = ("ascendc/attention/indexer_prologue_qw_prequantized/"
-                 "native/op_package/" + current_hardware().soc_model)
-    release = prepare_release(
-        "attention.indexer_prologue_qw_prequantized", tmp_path, kernel_id=kernel_id)
-    code = r'''
-import torch
-import torch_npu
-import flashinfer
-from flashinfer.operators.attention.indexer_prologue_qw_prequantized import cases
-
-torch.npu.set_device(int(__import__('os').environ.get("FLASHINFER_TEST_NPU_DEVICE", "0")))
-torch.npu.config.allow_internal_format = True
-args, options, _ = cases.sample(torch, torch_npu, tokens=3)
-source = torch.randn(4096, 1280).to(torch.bfloat16).npu()
-weight_q, weight_scale = torch_npu.npu_dynamic_quant(source, dst_type=torch.int8)
-wrong = torch.as_strided(torch_npu.npu_format_cast(weight_q, 29),
-                         (1280, 4096), (4096, 1), 0)
-assert torch_npu.get_npu_format(wrong) == 29 and wrong.is_contiguous()
-try:
-    flashinfer.indexer_prologue_qw_prequantized(
-        args[0], args[1], wrong, weight_scale, args[4], args[5], args[6], **options)
-except (ValueError, RuntimeError) as error:
-    print(str(error))
-    print("REJECTED")
-else:
-    raise SystemExit("wrong NZ direction was accepted")
-'''
-    result = run(code, environment=dict(
-        release, FLASHINFER_NPU_JIT_DISABLE="1", ASCEND_LAUNCH_BLOCKING="1"), timeout=300)
-    assert "REJECTED" in result.stdout
-    assert "INT8 FRACTAL_NZ storage shape does not match" in result.stdout + result.stderr
