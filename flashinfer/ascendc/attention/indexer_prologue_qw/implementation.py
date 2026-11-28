@@ -20,7 +20,7 @@ def _tensor(name, role, dtype, shape, alternate=()):
                            shape_alternatives=alternate)
 
 
-IMPLEMENTATIONS = AscendCImplementation.for_targets(
+DENSE_IMPLEMENTATIONS = AscendCImplementation.for_targets(
     operator=OPERATOR,
     name="native/op_package",
     default_target="Ascend910B",
@@ -78,5 +78,8 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
     workspace_bound=MAX_WORKSPACE_BYTES,
 )
 
-IMPLEMENTATION = IMPLEMENTATIONS[0]
+from .prequantized import IMPLEMENTATIONS as PREQUANTIZED_IMPLEMENTATIONS
+
+IMPLEMENTATIONS = DENSE_IMPLEMENTATIONS + PREQUANTIZED_IMPLEMENTATIONS
+IMPLEMENTATION = DENSE_IMPLEMENTATIONS[0]
 NATIVE = IMPLEMENTATION.native

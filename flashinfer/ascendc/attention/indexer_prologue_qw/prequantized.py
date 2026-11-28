@@ -12,7 +12,7 @@ from flashinfer.operators.attention.indexer_prologue_qw.operator import OPERATOR
 from flashinfer.operators.author_api import Support
 from flashinfer.runtime import CapabilityCase
 from flashinfer.runtime.targets import ARCH22_SOCS
-from .runner import admission, make_runner
+from .prequantized_runner import admission, make_runner
 
 MAX_WORKSPACE_BYTES = 128 * 1024 * 1024
 

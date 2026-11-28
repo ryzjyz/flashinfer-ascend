@@ -9,7 +9,7 @@ import torch
 import flashinfer
 from flashinfer.ascendc import load_contract
 from flashinfer.ascendc.attention.indexer_prologue_qw.implementation import IMPLEMENTATION as DENSE
-from flashinfer.ascendc.attention.indexer_prologue_qw_prequantized.implementation import (
+from flashinfer.ascendc.attention.indexer_prologue_qw.prequantized import (
     IMPLEMENTATION as PREQUANTIZED,
 )
 from flashinfer.operators.attention.indexer_prologue_qw.operator import OPERATOR
