@@ -25,6 +25,9 @@ def test_current_device_sources_define_their_declared_literal_entry():
     for recipe in recipes:
         source = (ROOT / recipe.source.locator).read_text()
         assert 'FI_DEVICE_ENTRY' not in source
+        if recipe.task_type == 'aicpu':
+            assert re.search(r'\bREGISTER_CPU_KERNEL\s*\(', source), recipe.kernel_id
+            continue
         assert re.search(r'\b__global__\s+__aicore__\s+void\s+'
                          + re.escape(recipe.device_entry) + r'\s*\(', source), recipe.kernel_id
         previous = names.setdefault(recipe.device_entry, recipe.source.locator)
@@ -76,10 +79,11 @@ def test_named_entries_compile_and_bind_their_actual_opdef(kernel_id, entry_pack
     record = verify_build_directory(release)
     _, recipe, spec = load_contract(kernel_id)
     metadata, _ = verify_op_package(release, spec)
-    compute = package_target(recipe.target_soc)[0]
-    config = release / metadata['vendor_path'] / ('op_impl/ai_core/tbe/config/' + compute
-              + '/aic-' + compute + '-ops-info.json')
-    assert json.loads(config.read_text())[recipe.package_op_type]['opInterface']['value'] == recipe.device_entry
+    if recipe.task_type != 'aicpu':
+        compute = package_target(recipe.target_soc)[0]
+        config = release / metadata['vendor_path'] / ('op_impl/ai_core/tbe/config/' + compute
+                  + '/aic-' + compute + '-ops-info.json')
+        assert json.loads(config.read_text())[recipe.package_op_type]['opInterface']['value'] == recipe.device_entry
     log = DiskJitBuildStore(cache).directory(record) / 'build.log'
     assert 'FI_DEVICE_ENTRY' not in log.read_text(errors='replace')
 

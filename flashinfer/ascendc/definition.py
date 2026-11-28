@@ -1,6 +1,7 @@
 """Ascend C authoring inputs. These fields do not belong to logical operators."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 from flashinfer.runtime import CapabilitySpec, SchemaError
 from flashinfer.operators.implementation import ImplementationDefinition
@@ -12,7 +13,7 @@ class BuildConfig:
     device: str
     host: tuple
     op_type: str
-    tiling: str
+    tiling: Optional[str]
     includes: tuple = ("op_kernel", "op_host")
     cmake: object = None
     implementation: str = "native"
@@ -31,6 +32,8 @@ class BuildConfig:
     recipe_id: object = None
     tiling_mode: str = "host_dynamic"
     block_dim: int = 1
+    shared_header_dirs: tuple = ()  # Repository-relative directories outside the operator tree.
+    shared_headers: tuple = ()  # Individual repository-relative headers.
 
 
 @dataclass(frozen=True)
@@ -159,11 +162,6 @@ class AscendCImplementation(ImplementationDefinition):
             from flashinfer.operators.capability import direct_operator_binding
 
             metadata.setdefault("capability_binding", direct_operator_binding(
-                operator, capability, "ascendc", kernel_id))
-        elif operator.torch_contract:
-            from flashinfer.operators.capability import rich_operator_binding
-
-            metadata.setdefault("capability_binding", rich_operator_binding(
                 operator, capability, "ascendc", kernel_id))
         native = NativeDefinition(
             name=build.recipe_id or operator.name,

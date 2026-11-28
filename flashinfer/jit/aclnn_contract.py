@@ -18,6 +18,8 @@ class TensorDtypeConversion:
         if (self.storage_dtype, self.native_dtype, self.element_multiplier) not in {
             ("int32", "int4", 8),
             ("int64", "uint64", 1),
+            ("float4_e2m1fn_x2", "float4_e2m1", 2),
+            ("float8_e8m0fnu", "float8_e8m0", 1),
         }:
             raise SchemaError("unsupported explicit ACLNN storage representation")
 

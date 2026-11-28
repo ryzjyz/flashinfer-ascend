@@ -94,24 +94,18 @@ def validate_device_entry(recipe, ops_info):
 
 def torch_call(recipe):
     """Generate the same C++ EXEC_NPU_CMD call an operator author would write."""
-    params = recipe["tensor_parameters"]
-    input_count = sum(p["role"] == "input" for p in params)
-    indices = {p["name"]: i for i, p in enumerate(params)}
-    aliases = tuple((indices[p["alias_of"]], i) for i, p in enumerate(params)
-                    if p.get("alias_of") is not None)
-    alias_operands = {index for pair in aliases for index in pair}
     lines = [
         '#include "aclnn_adapter.h"',
         'using namespace flashinfer_aclnn;',
         '#define FI_EXPORT extern "C" __attribute__((visibility("default")))',
         'FI_EXPORT const char* fi_submit_identity() { return "' + fingerprint(recipe) + '"; }',
         'FI_EXPORT void fi_submit(const Call& invocation) {',
-        '    Operands operands(invocation, %s);' % ('true' if not aliases else 'false'),
+        '    Operands operands(invocation);',
         '    TORCH_CHECK(invocation.attributes.size() == %d, "ACLNN attribute count mismatch");'
         % len(recipe.get("attributes", ())),
     ]
-    for source, output in aliases:
-        lines.append(f'    operands.exact_alias({source}, {output - input_count});')
+    params = recipe["tensor_parameters"]
+    slots = {param["name"]: index for index, param in enumerate(params)}
     arguments = []
     def tensor(i, param):
         listed, optional = param.get("tensor_list", False), param.get("optional", False)
@@ -120,10 +114,8 @@ def torch_call(recipe):
         fmt = sum({"ND": 1, "NZ": 2}[f] for f in param.get("physical_layouts", ("ND",)))
         flags = ", ".join(str(b).lower() for b in flags)
         cpu = str(param.get("device") == "cpu").lower()
-        strided = str(i in alias_operands).lower()
-        nz_orientation = str(param.get("nz_orientation", False)).lower()
-        lines.append(
-            f'    auto t{i} = operands.take({flags}, {fmt}, {cpu}, {strided}, {nz_orientation});')
+        strided = ", true" if param.get("allow_strided") else ""
+        lines.append(f'    auto t{i} = operands.take({flags}, {fmt}, {cpu}{strided});')
         if listed:
             value = f't{i}' if optional else f'*t{i}'
         elif optional:
@@ -132,8 +124,9 @@ def torch_call(recipe):
             value = f't{i}->front()'
         conversion = param.get("native_conversions", ())
         if conversion:
-            packed = str(conversion[0]["native_dtype"] == "int4").lower()
-            value = f'StorageView{{{value}, {packed}}}'
+            kind = {"int4": "Int4", "uint64": "UInt64", "float4_e2m1": "Float4E2M1",
+                    "float8_e8m0": "Float8E8M0"}[conversion[0]["native_dtype"]]
+            value = f'StorageView{{{value}, StorageKind::{kind}}}'
         lines.append(f'    auto p{i} = {value};')
         arguments.append(f'p{i}')
     for i, param in enumerate(params):
@@ -165,6 +158,10 @@ def torch_call(recipe):
     for i, param in enumerate(params):
         if param["role"] == "output":
             tensor(i, param)
+    # Use the consumed Tensor slices so optional and TensorList widths are resolved.
+    for i, param in enumerate(params):
+        if param.get("alias_of") is not None:
+            lines.append(f'    operands.exact_alias(*t{slots[param["alias_of"]]}, *t{i});')
     lines += ['    operands.finish();', '    EXEC_NPU_CMD(' + recipe["host_entry"] + ', ' + ', '.join(arguments) + ');', '}']
     return "\n".join(lines) + "\n"
 

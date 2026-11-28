@@ -1,10 +1,10 @@
 // Included only by the per-package typed call site generated at build time.
 #pragma once
-// TorchNPU may carry an older same-guard ACL declaration. Select the explicit
-// CANN toolchain first so its complete aclDataType enum remains visible.
 #include <acl/acl_base.h>
 #include "call.h"
+#include <algorithm>
 #include <deque>
+#include <limits>
 #include "torch_npu/csrc/core/npu/NPUFormat.h"
 #define FI_ACLNN_WORKSPACE_FN(api) invocation.workspace_fn
 #define FI_ACLNN_LAUNCH_FN(api) invocation.launch_fn
@@ -24,89 +24,82 @@ struct Owners {
 };
 
 class Operands {
+    const Call& call_;
     at::TensorList inputs_, outputs_;
-    at::TensorList original_inputs_, original_outputs_;
     at::IntArrayRef widths_;
-    bool lists_;
-    size_t input_position_ = 0, output_position_ = 0;
     std::vector<std::pair<size_t, size_t>> aliases_;
     const c10_npu::NPUStream stream_ = c10_npu::getCurrentNPUStream();
 
-    bool declared_alias(bool output, size_t position) const {
-        return std::any_of(aliases_.begin(), aliases_.end(), [&](const auto& pair) {
-            return output ? pair.second == position : pair.first == position;
-        });
+    static size_t flat_index(at::TensorList values, const at::Tensor* slot) {
+        auto it = std::find_if(values.begin(), values.end(), [slot](const at::Tensor& t) { return &t == slot; });
+        TORCH_INTERNAL_ASSERT(it != values.end(), "ACLNN alias must refer to a resolved operand");
+        return it - values.begin();
     }
-    static std::pair<uintptr_t, uintptr_t> range(const at::Tensor& tensor) {
-        // NZ descriptors cover their complete physical storage, not just the
-        // logical shape. ND views use their actual strided storage span.
-        if (at_npu::native::get_npu_format(tensor) == ACL_FORMAT_FRACTAL_NZ) {
-            const auto lo = reinterpret_cast<uintptr_t>(tensor.storage().data());
-            return {lo, lo + tensor.storage().nbytes()};
+
+    static size_t strided_bytes(const at::Tensor& tensor, bool writable) {
+        if (tensor.numel() == 0) return 0;
+        const auto itemsize = tensor.element_size();
+        const auto capacity = tensor.storage().nbytes() / itemsize;
+        const auto offset = tensor.storage_offset();
+        TORCH_CHECK(offset >= 0 && static_cast<size_t>(offset) < capacity,
+                    "ACLNN strided Tensor exceeds its storage span");
+        const size_t available = capacity - offset;
+        size_t span = 1;
+        c10::SmallVector<std::pair<size_t, size_t>, 5> axes;
+        for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+            const auto stride = tensor.stride(dim);
+            TORCH_CHECK(stride >= 0, "ACLNN strided Tensor requires nonnegative strides");
+            if (tensor.size(dim) <= 1) continue;
+            const auto steps = static_cast<size_t>(tensor.size(dim) - 1);
+            TORCH_CHECK(stride > 0, "ACLNN strided Tensor requires positive strides on non-singleton axes");
+            TORCH_CHECK(static_cast<size_t>(stride) <= (available - span) / steps,
+                        "ACLNN strided Tensor exceeds its storage span");
+            span += steps * stride;
+            if (writable) axes.emplace_back(stride, steps);
         }
-        const auto lo = reinterpret_cast<uintptr_t>(tensor.data_ptr());
-        if (tensor.numel() == 0) return {lo, lo};
-        uint64_t elements = 1;
-        for (size_t dim = 0; dim < tensor.dim(); ++dim) {
-            if (tensor.size(dim) > 1) {
-                elements += static_cast<uint64_t>(tensor.size(dim) - 1) * tensor.stride(dim);
+        if (writable) {
+            std::sort(axes.begin(), axes.end());
+            size_t occupied = 1;
+            for (const auto& [stride, steps] : axes) {
+                TORCH_CHECK(stride >= occupied, "ACLNN strided output has internally overlapping elements");
+                occupied += steps * stride;
             }
         }
-        return {lo, lo + elements * tensor.element_size()};
+        return span * itemsize;
     }
-    // Upstream overlap semantics: logical byte span for ND, full storage for NZ.
-    static std::pair<uintptr_t, uintptr_t> legacy_range(const at::Tensor& tensor) {
-        const bool nz = at_npu::native::get_npu_format(tensor) == ACL_FORMAT_FRACTAL_NZ;
-        const auto lo = reinterpret_cast<uintptr_t>(nz ? tensor.storage().data() : tensor.data_ptr());
-        return {lo, lo + (nz ? tensor.storage().nbytes() : tensor.nbytes())};
+
+    static std::pair<uintptr_t, uintptr_t> range(const at::Tensor& tensor) {
+        if (tensor.numel() == 0) return {0, 0};
+        if (at_npu::native::get_npu_format(tensor) == ACL_FORMAT_FRACTAL_NZ) {
+            const auto begin = reinterpret_cast<uintptr_t>(tensor.storage().data());
+            return {begin, begin + tensor.storage().nbytes()};
+        }
+        const auto begin = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+        const auto bytes = tensor.is_contiguous() ? tensor.nbytes() : strided_bytes(tensor, false);
+        return {begin, begin + bytes};
     }
+
 public:
     const std::shared_ptr<Owners> keepalive;
-    explicit Operands(const Call& c, bool early_overlap = true) : inputs_(c.inputs), outputs_(c.outputs),
-            original_inputs_(c.inputs), original_outputs_(c.outputs), widths_(c.widths),
-            lists_(!c.widths.empty()), keepalive(std::make_shared<Owners>(c)) {
-        if (!early_overlap) return;
-        for (size_t i = 0; i < c.outputs.size(); ++i) {
-            const auto& out = c.outputs[i];
-            auto overlaps = [&](const at::Tensor& t) {
-                if (t.device() != out.device()) return false;
-                auto a = legacy_range(out), b = legacy_range(t);
-                return std::max(a.first, b.first) < std::min(a.second, b.second);
-            };
-            for (const auto& t : c.inputs) TORCH_CHECK(!overlaps(t), "ACLNN output tensors must not overlap other arguments");
-            for (size_t j = 0; j < i; ++j) TORCH_CHECK(!overlaps(c.outputs[j]), "ACLNN outputs must not overlap");
-        }
-    }
+    explicit Operands(const Call& c) : call_(c), inputs_(c.inputs), outputs_(c.outputs), widths_(c.widths),
+            keepalive(std::make_shared<Owners>(c)) {}
 
-    // Rich mutation operators pass the same cache view as an input and output.
-    // Register the exact pair before consuming operands; all other overlap is
-    // still rejected by finish(). Indices are package-local input/output slots.
-    void exact_alias(size_t input, size_t output) {
-        TORCH_CHECK(input < original_inputs_.size() && output < original_outputs_.size(),
-                    "Invalid ACLNN exact-alias indices");
-        TORCH_CHECK(std::none_of(aliases_.begin(), aliases_.end(), [&](const auto& pair) {
-            return pair.second == output;
-        }), "An ACLNN output may have only one exact alias");
-        const auto& source = original_inputs_[input];
-        const auto& target = original_outputs_[output];
-        TORCH_CHECK(source.data_ptr() == target.data_ptr() &&
-                    source.storage().data_ptr() == target.storage().data_ptr() &&
-                    source.sizes() == target.sizes() && source.strides() == target.strides() &&
-                    source.storage_offset() == target.storage_offset() &&
-                    source.scalar_type() == target.scalar_type(),
+    void exact_alias(at::TensorList input, at::TensorList output) {
+        TORCH_INTERNAL_ASSERT(input.size() == 1 && output.size() == 1);
+        const auto& a = input.front();
+        const auto& b = output.front();
+        TORCH_CHECK(a.device() == b.device() && a.is_alias_of(b) &&
+                    a.scalar_type() == b.scalar_type() && a.storage_offset() == b.storage_offset() &&
+                    a.sizes() == b.sizes() && a.strides() == b.strides(),
                     "ACLNN alias pair must be the exact same storage view");
-        aliases_.emplace_back(input, output);
+        aliases_.emplace_back(flat_index(call_.inputs, input.data()), flat_index(call_.outputs, output.data()));
     }
-
     // -1 is an absent optional argument. Zero is a present empty TensorList.
-    c10::optional<at::TensorList> take(bool output, bool list, bool optional, int layouts,
-                                      bool cpu, bool strided_alias, bool nz_orientation) {
+    c10::optional<at::TensorList> take(bool output, bool list, bool optional, int layouts, bool cpu,
+                                      bool allow_strided = false) {
         auto& source = output ? outputs_ : inputs_;
-        const size_t position = output ? output_position_++ : input_position_++;
-        TORCH_CHECK(strided_alias == declared_alias(output, position),
-                    "Strided ACLNN operands require an exact-alias declaration");
         int64_t width = 1;
-        if (lists_) {
+        if (!call_.widths.empty()) {
             TORCH_CHECK(!widths_.empty(), "Missing ACLNN operand width");
             width = widths_.front();
             widths_ = widths_.slice(1);
@@ -121,40 +114,18 @@ public:
                 TORCH_CHECK(tensor.device().is_cpu(), "Expected a declared CPU tensor");
                 continue;
             }
-            if (!strided_alias) {
-                TORCH_CHECK(tensor.device() == stream_.device() && tensor.is_contiguous(),
-                            "ACLNN tensor violates its declared device/format");
-            } else {
-                TORCH_CHECK(tensor.device() == stream_.device(),
-                            "ACLNN tensor violates its declared device/format");
-            }
+            TORCH_CHECK(tensor.device() == stream_.device(),
+                        "ACLNN tensor violates its declared device/format");
             const auto format = at_npu::native::get_npu_format(tensor);
             const int mask = format == ACL_FORMAT_ND ? 1 : format == ACL_FORMAT_FRACTAL_NZ ? 2 : 0;
             TORCH_CHECK(layouts & mask, "ACLNN tensor violates its declared device/format");
-            if (strided_alias) {
-                TORCH_CHECK(format == ACL_FORMAT_ND,
-                            "ACLNN strided aliases require physical ND tensors");
-                const auto strides = tensor.strides();
-                TORCH_CHECK(!strides.empty() && strides[strides.size() - 1] == 1,
-                            "ACLNN strided alias requires a contiguous last axis");
-                int64_t span = tensor.storage_offset();
-                for (size_t dim = 0; dim < strides.size(); ++dim) {
-                    TORCH_CHECK(tensor.size(dim) > 0 && strides[dim] >= 0,
-                                "ACLNN strided alias requires positive shapes and nonnegative strides");
-                    if (tensor.size(dim) > 1) {
-                        TORCH_CHECK(strides[dim] > 0,
-                                    "ACLNN strided alias requires positive strides on non-singleton axes");
-                        span += (tensor.size(dim) - 1) * strides[dim];
-                    }
-                }
-                TORCH_CHECK(span >= 0 && static_cast<uint64_t>(span) <
-                            static_cast<uint64_t>(tensor.storage().nbytes() / tensor.element_size()),
-                            "ACLNN strided alias exceeds its storage span");
+            if (!tensor.is_contiguous()) {
+                TORCH_CHECK(allow_strided && format == ACL_FORMAT_ND,
+                            "ACLNN tensor violates its declared device/format");
+                strided_bytes(tensor, output);
             }
-            if (nz_orientation && format == ACL_FORMAT_FRACTAL_NZ && tensor.dim() == 2 &&
-                tensor.scalar_type() == at::kChar) {
-                // INT8 NZ is physically [ceil(N/32), ceil(M/16), 16, 32].
-                // Reject a transposed backing with the wrong logical orientation.
+            if (format == ACL_FORMAT_FRACTAL_NZ && tensor.dim() == 2 && tensor.scalar_type() == at::kChar) {
+                // INT8 NZ stores N in groups of 32 and M in groups of 16.
                 const std::vector<int64_t> expected = {
                     (tensor.size(1) + 31) / 32, (tensor.size(0) + 15) / 16, 16, 32};
                 TORCH_CHECK(at_npu::native::get_npu_storage_sizes(tensor) == expected,
@@ -179,60 +150,71 @@ public:
     }
     void finish() const {
         TORCH_CHECK(inputs_.empty() && outputs_.empty() && widths_.empty(), "Extra ACLNN operands");
-        // Non-alias packages already ran the upstream overlap check at construction.
-        if (aliases_.empty()) return;
-        for (size_t out = 0; out < original_outputs_.size(); ++out) {
-            const auto& target = original_outputs_[out];
+        for (size_t out = 0; out < call_.outputs.size(); ++out) {
+            const auto& target = call_.outputs[out];
+            const auto a = range(target);
             auto overlaps = [&](const at::Tensor& other) {
                 if (other.device() != target.device()) return false;
-                const auto a = range(target), b = range(other);
+                const auto b = range(other);
                 return std::max(a.first, b.first) < std::min(a.second, b.second);
             };
-            for (size_t input = 0; input < original_inputs_.size(); ++input) {
-                const bool allowed = std::any_of(aliases_.begin(), aliases_.end(), [&](const auto& pair) {
-                    return pair.first == input && pair.second == out;
-                });
-                TORCH_CHECK(allowed || !overlaps(original_inputs_[input]),
+            for (size_t input = 0; input < call_.inputs.size(); ++input) {
+                const auto pair = std::make_pair(input, out);
+                TORCH_CHECK(std::find(aliases_.begin(), aliases_.end(), pair) != aliases_.end()
+                                || !overlaps(call_.inputs[input]),
                             "ACLNN output tensors must not overlap other arguments");
             }
             for (size_t prior = 0; prior < out; ++prior) {
-                TORCH_CHECK(!overlaps(original_outputs_[prior]),
-                            "ACLNN outputs must not overlap");
+                TORCH_CHECK(!overlaps(call_.outputs[prior]), "ACLNN outputs must not overlap");
             }
         }
     }
 };
 
-// The two pre-existing NativeBinding packed representations are views of storage.
-// They pass through the same upstream conversion/release and submission template.
-struct StorageView { at::Tensor tensor; bool packed_int4; };
+// NativeBinding storage conversions change the descriptor, without copying the Tensor.
+enum class StorageKind { Int4, UInt64, Float4E2M1, Float8E8M0 };
+struct StorageView { at::Tensor tensor; StorageKind kind; };
 inline aclTensor* ConvertType(const StorageView& v) {
     const auto& t = v.tensor;
     if (!t.defined()) return nullptr;
-    const bool int4 = v.packed_int4 && t.scalar_type() == at::kInt;
-    const bool uint64 = !v.packed_int4 && t.scalar_type() == at::kLong;
-    if (!int4 && !uint64) return ::ConvertType(t);
+    const bool int4 = v.kind == StorageKind::Int4 && t.scalar_type() == at::kInt;
+    const bool uint64 = v.kind == StorageKind::UInt64 && t.scalar_type() == at::kLong;
+    const bool fp4 = v.kind == StorageKind::Float4E2M1 && t.scalar_type() == at::ScalarType::Float4_e2m1fn_x2;
+    const bool e8m0 = v.kind == StorageKind::Float8E8M0 && t.scalar_type() == at::ScalarType::Float8_e8m0fnu;
+    if (!int4 && !uint64 && !fp4 && !e8m0) return ::ConvertType(t);
     auto sizes = t.sizes().vec(), strides = t.strides().vec();
     auto offset = t.storage_offset();
     auto format = static_cast<aclFormat>(at_npu::native::get_npu_format(t));
     auto storage = format == ACL_FORMAT_FRACTAL_NZ ? at_npu::native::get_npu_storage_sizes(t)
         : std::vector<int64_t>{static_cast<int64_t>(t.storage().nbytes() / t.element_size())};
-    if (int4) {
-        TORCH_CHECK(!sizes.empty() && !storage.empty(), "Packed int4 requires dimensional metadata");
-        sizes.back() *= 8;
-        for (size_t i = 1; i < strides.size(); ++i) strides[i-1] *= 8;
-        storage.back() *= 8;
-        offset *= 8;
-        if (format == ACL_FORMAT_FRACTAL_NZ) {
-            TORCH_CHECK(sizes.size() >= 2 && sizes.back() % 64 == 0 && sizes[sizes.size()-2] % 16 == 0,
-                        "Native INT4 NZ requires N aligned to 64 and K aligned to 16");
-            storage.assign(sizes.begin(), sizes.end()-2);
-            storage.insert(storage.end(), {sizes.back()/64, sizes[sizes.size()-2]/16, 16, 64});
-        }
+    if (fp4 || e8m0) {
+        TORCH_CHECK(format == ACL_FORMAT_ND && t.element_size() == 1 && !sizes.empty(),
+                    "MXFP4/E8M0 require ND byte-addressable storage");
+    }
+    if (int4 || fp4) {
+        TORCH_CHECK(!sizes.empty() && !storage.empty(), "Packed storage requires dimensional metadata");
+        TORCH_CHECK(!fp4 || strides.back() == 1, "MXFP4 packed dimension must be contiguous");
+        const int64_t multiplier = int4 ? 8 : 2;
+        const auto unpack = [multiplier](int64_t value) {
+            TORCH_CHECK(value >= 0 && value <= std::numeric_limits<int64_t>::max() / multiplier,
+                        "ACLNN packed shape, stride or offset overflows");
+            return value * multiplier;
+        };
+        sizes.back() = unpack(sizes.back());
+        for (size_t i = 1; i < strides.size(); ++i) strides[i - 1] = unpack(strides[i - 1]);
+        storage.back() = unpack(storage.back());
+        offset = unpack(offset);
+    }
+    if (int4 && format == ACL_FORMAT_FRACTAL_NZ) {
+        TORCH_CHECK(sizes.size() >= 2 && sizes.back() % 64 == 0 && sizes[sizes.size()-2] % 16 == 0,
+                    "Native INT4 NZ requires N aligned to 64 and K aligned to 16");
+        storage.assign(sizes.begin(), sizes.end()-2);
+        storage.insert(storage.end(), {sizes.back()/64, sizes[sizes.size()-2]/16, 16, 64});
     }
     static const auto create = GET_OP_API_FUNC(aclCreateTensor);
     TORCH_CHECK(create, "aclCreateTensor unavailable");
-    auto* descriptor = create(sizes.data(), sizes.size(), int4 ? ACL_INT4 : ACL_UINT64,
+    const auto dtype = int4 ? ACL_INT4 : uint64 ? ACL_UINT64 : fp4 ? ACL_FLOAT4_E2M1 : ACL_FLOAT8_E8M0;
+    auto* descriptor = create(sizes.data(), sizes.size(), dtype,
                               strides.data(), offset, format, storage.data(), storage.size(),
                               const_cast<void*>(t.storage().data()));
     TORCH_CHECK(descriptor, "aclCreateTensor failed for packed storage");

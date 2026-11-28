@@ -188,7 +188,7 @@ def validate_indexer_prologue_k_call(
 
 def indexer_prologue_k(
         latent, wk, norm_weight, rope_cos, rope_sin, indices, k_cache,
-        k_scale_cache, norm_eps=1e-6):
+        k_scale_cache, norm_eps=1e-6, kernel_id=None, backend=None):
     """Mutate caller-owned K/scale caches in place; return None.
 
     ``T=0`` performs only static checks and returns without touching the AOT
@@ -198,6 +198,10 @@ def indexer_prologue_k(
     """
     import torch
 
+    # Generic harnesses pass routing hints to every public facade. This rich
+    # mutation facade owns its dispatch (the registered Torch schema), so the
+    # hints are accepted for ABI compatibility and intentionally unused.
+    del kernel_id, backend
     tokens = validate_indexer_prologue_k_static(
         latent, wk, norm_weight, rope_cos, rope_sin, indices, k_cache,
         k_scale_cache, norm_eps)[0]

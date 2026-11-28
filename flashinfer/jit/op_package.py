@@ -83,7 +83,7 @@ def collect_package(spec, recipe, build, directory, *, source_root, toolchain):
 
 
 def verify_op_package(directory, spec):
-    """Verify manifest binding, ACLNN host ELF, config references and NPU ET_EXEC.
+    """Verify manifest binding, ACLNN host ELF and the declared device payload.
 
     A direct device -c ET_REL and a host ET_DYN are both rejected as package
     kernels. Extensions and CANN's filename hash never select the loader.
@@ -123,6 +123,12 @@ def verify_op_package(directory, spec):
                              machine=machines[platform.machine()], elf_type=3, dynamic_only=True)
         if not {"fi_submit", "fi_submit_identity"} <= submit:
             raise OpPackageSymbolError("Missing typed ACLNN submission entry")
+    if recipe.task_type == "aicpu":
+        if data["schema_version"] != 2:
+            raise SchemaError("AICPU packages require the typed ACLNN adapter")
+        _verify_aicpu_kernel(directory, vendor, recipe)
+        _file(directory, data["run_file"])
+        return data, recipe
     kernel = vendor + "/op_impl/ai_core/tbe/kernel/"
     config = json.loads(_file(directory, kernel + "config/" + compute + "/binary_info_config.json").read_text())
     if set(config) != {recipe.package_op_type}:
@@ -220,6 +226,25 @@ def _binary_tensor_signatures(recipe, support):
             choices.append({p.get("dtype") for p in members})
     return _matching_signatures(choices, recipe.native_dtype_signatures,
                                 "v2 package tensor parameter order/types differ from recipe: dtype signature")
+
+
+def _verify_aicpu_kernel(directory, vendor, recipe):
+    cpu_root = vendor + "/op_impl/cpu/"
+    registration = json.loads(_file(directory, cpu_root + "config/cust_aicpu_kernel.json").read_text())
+    if not isinstance(registration, dict) or set(registration) != {recipe.package_op_type}:
+        raise SchemaError("AICPU registry must identify exactly the declared op type")
+    record = registration[recipe.package_op_type]
+    info = record.get("opInfo") if isinstance(record, dict) else None
+    if not isinstance(info, dict):
+        raise SchemaError("AICPU registration must contain opInfo")
+    library = info.get("kernelSo")
+    if (info.get("engine") != "DNN_VM_AICPU" or info.get("opKernelLib") != "CUSTAICPUKernel"
+            or info.get("userDefined") != "True" or info.get("functionName") != recipe.device_entry
+            or not isinstance(library, str) or not re.fullmatch(r"lib[A-Za-z0-9_]+\.so", library)):
+        raise SchemaError("invalid custom AICPU kernel registration")
+    binary = _file(directory, cpu_root + "aicpu_kernel/impl/" + library).read_bytes()
+    if recipe.device_entry not in elf_symbols(binary, machine=183, elf_type=3, dynamic_only=True):
+        raise OpPackageSymbolError("AICPU library has no device entry: " + recipe.device_entry)
 
 
 def _verify_native_adapter(directory, data, recipe, symbols):

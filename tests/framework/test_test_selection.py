@@ -173,14 +173,17 @@ def test_two_local_implementations_are_collected_and_executed_separately(monkeyp
     assert calls == [("first", 1, False), ("first", 1, True), ("second", 2, False), ("second", 2, True)]
 
 
-def test_rich_void_mutation_skips_out_and_schema_only_route_options(monkeypatch):
+def test_void_mutation_skips_schema_only_route_options(monkeypatch):
     import torch
+    from flashinfer.jit.torch_library import AscendCOp
     from flashinfer.operators import testing
 
+    def declarations():
+        return (AscendCOp("flashinfer::test_mutation", "(Tensor(a!) value) -> ()",
+                          lambda value: None, lambda value: None, ("value",)),)
+
     operator = SimpleNamespace(
-        schema="", output_names=(),
-        torch_contract=("(Tensor(a!) value) -> ()", ("value",)),
-    )
+        schema="", output_names=(), torch_declarations=declarations)
     monkeypatch.setattr(testing, "definition", lambda _: operator)
     calls = []
 
@@ -199,12 +202,11 @@ def test_rich_void_mutation_skips_out_and_schema_only_route_options(monkeypatch)
     monkeypatch.setattr(testing, "cases_module", lambda _: cases)
 
     def mutate(value, **kwargs):
-        assert not kwargs
-        calls.append(value.data_ptr())
+        calls.append(kwargs)
         value.add_(1)
 
     monkeypatch.setattr(testing, "public_function", lambda _: mutate)
     result = testing.numerical_cases(
         torch, None, "test.mutation", kernel_id="rich/id", backend="ascendc")
-    assert len(calls) == 1
+    assert calls == [{}]
     assert result["0"]["max_abs"] == [0.0]

@@ -192,6 +192,46 @@ def test_mixed_package_verifies_both_core_entries_and_declared_abi(mixed_package
     assert verify_op_package(directory, spec)[1] == recipe
 
 
+def test_aicpu_package_checks_registration_and_device_elf(mixed_package):
+    from flashinfer.jit.op_package import OpPackageSymbolError
+    from flashinfer.runtime import SourceRef
+
+    directory, spec, recipe, _, _ = mixed_package
+    cmake = SourceRef("operator", "fixture/CMakeLists.txt", "c" * 64)
+    recipe = replace(recipe, task_type="aicpu", device_entry="RunCpuKernel", sync_policy="compiler_default",
+                     tiling_mode="none", tiling_host_entry=None, allow_jit_fallback=False,
+                     workspace_host_entry=recipe.host_entry + "GetWorkspaceSize",
+                     cmake_entry=cmake.locator, extra_build_files=(cmake,))
+    assert recipe.device_parameter_order == ()
+    with pytest.raises(SchemaError, match="standalone native AOT"):
+        replace(recipe, tiling_mode="host_dynamic", tiling_host_entry="FixtureTiling")
+    with pytest.raises(SchemaError, match="GetWorkspaceSize"):
+        replace(recipe, workspace_host_entry="AnotherWorkspace")
+
+    spec = replace(spec, input_fingerprints=tuple(
+        (key, recipe.fingerprint if key == "build_recipe" else value) for key, value in spec.input_fingerprints))
+    package = directory / "aicpu"
+    write_fixture(package, recipe, spec)
+    vendor = package / "packages/vendors" / recipe.package_vendor
+    cpu = vendor / "op_impl/cpu"
+    registration = cpu / "config/cust_aicpu_kernel.json"
+    registration.parent.mkdir(parents=True)
+    binary = cpu / "aicpu_kernel/impl/libfixture.so"
+    binary.parent.mkdir(parents=True)
+    info = dict(engine="DNN_VM_AICPU", opKernelLib="CUSTAICPUKernel", userDefined="True",
+                functionName=recipe.device_entry, kernelSo=binary.name)
+    registration.write_text(json.dumps({recipe.package_op_type: {"opInfo": info}}))
+    binary.write_bytes(elf_fixture((recipe.device_entry,), machine=183, kind=3))
+    assert verify_op_package(package, spec)[1] == recipe
+    binary.write_bytes(elf_fixture(("other_entry",), machine=183, kind=3))
+    with pytest.raises(OpPackageSymbolError, match="no device entry"):
+        verify_op_package(package, spec)
+    info["kernelSo"] = "../libfixture.so"
+    registration.write_text(json.dumps({recipe.package_op_type: {"opInfo": info}}))
+    with pytest.raises(SchemaError, match="invalid custom AICPU kernel registration"):
+        verify_op_package(package, spec)
+
+
 def test_vector_package_checks_aiv_metadata_and_unsuffixed_entry(mixed_package):
     directory, spec, recipe, paths, metadata = mixed_package
     recipe = replace(recipe, task_type="aiv_only", sync_policy="compiler_default")

@@ -63,6 +63,17 @@ def prepare_native(root, directory, native):
         for p in native_files
         if p.relative_to(root).as_posix() not in selected
     )
+    shared_headers = [reference(root / _path(locator)) for locator in build.shared_headers]
+    for locator in build.shared_header_dirs:
+        shared_dir = root / _path(locator)
+        if (shared_dir.is_symlink() or not shared_dir.is_dir()
+                or not shared_dir.resolve().is_relative_to(root)):
+            raise SchemaError("shared headers must be in an in-repository regular directory")
+        shared_headers.extend(
+            reference(p)
+            for p in sorted(shared_dir.rglob("*"))
+            if p.is_file() and p.suffix in {".h", ".hpp", ".inc"}
+        )
     extra = []
     native_paths = {p.resolve() for p in native_files}
     for path in sorted(source_dir.rglob("*")):
@@ -95,6 +106,8 @@ def prepare_native(root, directory, native):
         else None
     )
     _, arch = package_target(native.target_soc)
+    host_entry = build.host_entry or "aclnn" + build.op_type
+    workspace_entry = host_entry + "GetWorkspaceSize" if build.task_type == "aicpu" else build.tiling
     recipe = BuildRecipe(
         recipe_id=build.recipe_id or native.name,
         version=build.version,
@@ -104,7 +117,7 @@ def prepare_native(root, directory, native):
         npu_arch=arch,
         source=source,
         sources=(source,),
-        headers=headers,
+        headers=headers + tuple(sorted(shared_headers, key=lambda ref: ref.locator)),
         include_dirs=tuple(
             local(p).relative_to(root).as_posix() for p in build.includes
         ),
@@ -113,7 +126,7 @@ def prepare_native(root, directory, native):
         compile_options=build.compile_options,
         link_options=build.link_options,
         device_entry=build.device_entry or "fi_" + native.name,
-        host_entry=build.host_entry or "aclnn" + build.op_type,
+        host_entry=host_entry,
         launch_abi=build.launch_abi or "aclnn." + native.name + ".v2",
         tiling_mode=build.tiling_mode,
         tiling_schema_version=2,
@@ -127,9 +140,7 @@ def prepare_native(root, directory, native):
         tensor_parameters=native.tensors,
         shape_constraints=native.shapes,
         tiling_host_entry=build.tiling,
-        workspace_host_entry=(
-            build.tiling if build.workspace_bytes == "dynamic" else None
-        ),
+        workspace_host_entry=workspace_entry if build.workspace_bytes == "dynamic" else None,
         dtype_signatures=native.dtype_signatures,
         allow_jit_fallback=native.allow_jit_fallback,
         attributes=native.attributes,

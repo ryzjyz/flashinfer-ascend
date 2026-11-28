@@ -23,7 +23,7 @@ def schema_arguments(schema):
             keyword_only = True
             continue
         match = re.fullmatch(
-            r"(Tensor\??|float|int|bool|str\??) ([a-z][a-z0-9_]*)(?:=(.+))?", value
+            r"(Tensor\??|float|int\??|bool|str\??) ([a-z][a-z0-9_]*)(?:=(.+))?", value
         )
         if match is None:
             raise SchemaError("unsupported author schema argument: " + value)
@@ -90,9 +90,6 @@ class OperatorDefinition:
     public_entry: object = None
     description: str = ""
     tensor_shapes: tuple = ()
-    # Rich operators own their Torch schema and mutation set explicitly so the
-    # capability fingerprint can bind the public contract.
-    torch_contract: tuple = ()
     torch_declarations: object = None
 
     def __post_init__(self):
@@ -107,16 +104,6 @@ class OperatorDefinition:
             and not callable(self.validate_values)
         ):
             raise SchemaError("invalid logical operator definition")
-        if self.torch_contract:
-            if (
-                not isinstance(self.torch_contract, tuple)
-                or len(self.torch_contract) != 2
-                or not isinstance(self.torch_contract[0], str)
-                or not self.torch_contract[0].startswith("(")
-                or not isinstance(self.torch_contract[1], tuple)
-                or any(not isinstance(name, str) or not name for name in self.torch_contract[1])
-            ):
-                raise SchemaError("torch_contract must be (schema, mutates_args)")
         if self.torch_declarations is not None and (
             self.schema or not self.public_entry or not callable(self.torch_declarations)
         ):

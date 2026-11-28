@@ -13,8 +13,10 @@ MAX_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
 def _cache(name, role, dtype, shape, alias_of=None):
+    # Caller-owned caches use independent block/slot strides in the public
+    # contract; the upstream binding validates the declared ND strided span.
     return TensorParameter(name=name, role=role, dtype=dtype, shape=shape,
-                           alias_of=alias_of)
+                           allow_strided=True, alias_of=alias_of)
 
 
 IMPLEMENTATIONS = AscendCImplementation.for_targets(

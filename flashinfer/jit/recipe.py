@@ -94,13 +94,10 @@ class TensorParameter:
     shape_alternatives: Tuple[Tuple[Union[str, int], ...], ...] = ()
     native_conversions: Tuple[TensorDtypeConversion, ...] = ()
     optional_for_dtypes: Tuple[Tuple[int, str], ...] = ()
-    # Additive exact-alias declaration for mutation-only outputs. The named
-    # input and this output must share one storage view and independent strides.
-    alias_of: Optional[str] = None
-    # Opt-in INT8 2-D NZ storage-orientation guard for caller-supplied weights.
-    nz_orientation: bool = False
     tensor_list: bool = False
     device: str = "npu"
+    allow_strided: bool = False
+    alias_of: Optional[str] = None
 
     def __post_init__(self):
         if (not isinstance(self.name, str) or not _SYMBOL.fullmatch(self.name)
@@ -125,6 +122,13 @@ class TensorParameter:
         if not layouts or len(set(layouts)) != len(layouts) or set(layouts) - {"ND", "NZ"}:
             raise SchemaError("Tensor physical_layouts must explicitly declare ND/NZ")
         object.__setattr__(self, "physical_layouts", layouts)
+        if (type(self.allow_strided) is not bool
+                or self.allow_strided and (self.device != "npu" or "ND" not in layouts)):
+            raise SchemaError("strided storage requires a declared NPU ND layout")
+        if self.alias_of is not None and (
+                self.role != "output" or self.device != "npu" or self.tensor_list
+                or not isinstance(self.alias_of, str) or not _SYMBOL.fullmatch(self.alias_of)):
+            raise SchemaError("alias_of requires an NPU Tensor output and a named input")
         alternatives = tuple(tuple(s) for s in self.shape_alternatives)
         if len({len(s) for s in alternatives + (self.shape,)}) != len(alternatives) + 1:
             raise SchemaError("Tensor shape alternatives must be unique")
@@ -142,16 +146,6 @@ class TensorParameter:
                 or v[0] < 0 or v[1] not in _TENSOR_DTYPES for v in conditional)):
             raise SchemaError("conditional optional Tensor requires explicit operand dtype declarations")
         object.__setattr__(self, "optional_for_dtypes", conditional)
-        if self.alias_of is not None and (
-                self.role != "output" or not isinstance(self.alias_of, str)
-                or not _SYMBOL.fullmatch(self.alias_of)):
-            raise SchemaError("Tensor alias_of must name an input for an output parameter")
-        if type(self.nz_orientation) is not bool:
-            raise SchemaError("Tensor nz_orientation must be a bool")
-        if self.nz_orientation and (
-                self.role != "input" or self.dtype != "int8" or len(self.shape) != 2
-                or "NZ" not in layouts):
-            raise SchemaError("Tensor nz_orientation requires a 2-D INT8 NZ input")
 
     def native_type(self, storage_dtype):
         return next((c.native_dtype for c in self.native_conversions if c.storage_dtype == storage_dtype), storage_dtype)
@@ -160,9 +154,8 @@ class TensorParameter:
         value = asdict(self)
         for name, default in (("optional", False), ("physical_layouts", ("ND",)),
                               ("shape_alternatives", ()), ("native_conversions", ()),
-                              ("optional_for_dtypes", ()), ("alias_of", None),
-                              ("nz_orientation", False), ("tensor_list", False),
-                              ("device", "npu")):
+                              ("optional_for_dtypes", ()), ("tensor_list", False), ("device", "npu"),
+                              ("allow_strided", False), ("alias_of", None)):
             if getattr(self, name) == default:
                 value.pop(name)
         return value
@@ -321,12 +314,22 @@ class _Recipe:
             self._validate_v2()
 
     def _validate_v2(self):
-        if (self.output_kind != "op_package" or self.tiling_mode != "host_dynamic"
+        if (self.output_kind != "op_package"
                 or type(self.tiling_schema_version) is not int or self.tiling_schema_version < 2
                 or type(self.block_dim) is not int or self.block_dim < 1):
-            raise SchemaError("Ascend C v2 requires op_package, host_dynamic tiling schema >= 2 and positive block_dim")
-        if not isinstance(self.tiling_host_entry, str) or not _SYMBOL.fullmatch(self.tiling_host_entry):
-            raise SchemaError("host_dynamic tiling requires a tiling_host_entry C symbol")
+            raise SchemaError("Ascend C v2 requires op_package, tiling schema >= 2 and positive block_dim")
+        if self.task_type == "aicpu":
+            if (self.tiling_mode != "none" or self.tiling_host_entry is not None
+                    or self.device_entry != "RunCpuKernel" or self.block_dim != 1
+                    or self.cmake_entry is None or self.implementation != "native" or self.allow_jit_fallback):
+                raise SchemaError("AICPU requires a standalone native AOT package with no AI Core tiling")
+            if self.workspace_bytes != "dynamic" or self.workspace_host_entry != self.host_entry + "GetWorkspaceSize":
+                raise SchemaError("AICPU workspace must use the ACLNN GetWorkspaceSize entry")
+        else:
+            if self.tiling_mode != "host_dynamic":
+                raise SchemaError("Ascend C v2 requires host_dynamic tiling for AI Core")
+            if not isinstance(self.tiling_host_entry, str) or not _SYMBOL.fullmatch(self.tiling_host_entry):
+                raise SchemaError("host_dynamic tiling requires a tiling_host_entry C symbol")
         if self.workspace_bytes == "dynamic":
             if not isinstance(self.workspace_host_entry, str) or not _SYMBOL.fullmatch(self.workspace_host_entry):
                 raise SchemaError("dynamic workspace requires a workspace_host_entry C symbol")
@@ -337,7 +340,7 @@ class _Recipe:
         if self.task_type in {"aic_aiv", "aiv_hard_sync"}:
             if self.sync_policy != "cross_core_flags":
                 raise SchemaError(f"{self.task_type} requires explicit cross_core_flags synchronization")
-        elif self.task_type not in {"aic_only", "aiv_only"} or self.sync_policy != "compiler_default":
+        elif self.task_type not in {"aic_only", "aiv_only", "aicpu"} or self.sync_policy != "compiler_default":
             raise SchemaError("unsupported v2 task_type/sync_policy")
         parameters = self.tensor_parameters
         if (not parameters or any(not isinstance(p, TensorParameter) for p in parameters)
@@ -345,34 +348,33 @@ class _Recipe:
             raise SchemaError("v2 requires unique ordered tensor_parameters")
         if any(index >= len(parameters) for p in parameters for index, _ in p.optional_for_dtypes):
             raise SchemaError("conditional optional Tensor refers to an unknown operand")
-        alias_outputs = set()
-        for parameter in parameters:
-            if parameter.alias_of is None:
-                continue
-            aliased = next((p for p in parameters if p.name == parameter.alias_of), None)
-            if (aliased is None or aliased.role != "input"
-                    or aliased.dtype != parameter.dtype
-                    or aliased.shape != parameter.shape
-                    or aliased.shape_alternatives != parameter.shape_alternatives
-                    or aliased.physical_layouts != parameter.physical_layouts
-                    or parameter.physical_layouts != ("ND",)
-                    or parameter.tensor_list or parameter.device != "npu"
-                    or parameter.native_conversions
-                    or aliased.optional or aliased.tensor_list or aliased.device != "npu"
-                    or aliased.native_conversions
-                    or parameter.name in alias_outputs):
-                raise SchemaError("Tensor alias_of must bind one matching required ND input")
-            alias_outputs.add(parameter.name)
         # CANN-generated ACLNN APIs place input tensors before output tensors.
         roles = [p.role for p in parameters]
         if roles != sorted(roles):
             raise SchemaError("ACLNN tensor_parameters must declare inputs before outputs")
+        by_name = {p.name: p for p in parameters}
+        aliased_inputs = set()
+        for output in parameters:
+            if output.alias_of is None:
+                continue
+            source = by_name.get(output.alias_of)
+            if (source is None or source.role != "input" or source.optional or source.tensor_list
+                    or source.device != "npu" or source.name in aliased_inputs
+                    or source.dtype != output.dtype or source.shape != output.shape
+                    or source.shape_alternatives != output.shape_alternatives
+                    or source.physical_layouts != output.physical_layouts
+                    or source.native_conversions != output.native_conversions):
+                raise SchemaError("alias_of must name one matching required NPU Tensor input")
+            aliased_inputs.add(source.name)
         signatures = self.dtype_signatures
         if (any(len(s) != len(parameters) or any(not isinstance(d, str) or d not in _TENSOR_DTYPES
                                                for d in s) for s in signatures)
                 or len(set(signatures)) != len(signatures)
                 or (signatures and tuple(p.dtype for p in parameters) not in signatures)):
             raise SchemaError("dtype_signatures require unique complete supported dtype tuples including the base signature")
+        if any(signature[source] != signature[output] for source, output in self.alias_pairs
+               for signature in signatures):
+            raise SchemaError("alias_of requires matching input and output dtypes in every signature")
         constraints = self.shape_constraints
         symbols = {d for p in parameters for shape in (p.shape,) + p.shape_alternatives
                    for d in shape if isinstance(d, str)}
@@ -390,8 +392,16 @@ class _Recipe:
 
     @property
     def device_parameter_order(self):
-        """Device GM arguments; CANN supplies workspace and tiling via executor."""
+        """AI Core GM arguments. AICPU receives operands through its CPU context."""
+        if self.task_type == "aicpu":
+            return ()
         return self.tensor_parameter_names + ("workspace", "tiling")
+
+    @cached_property
+    def alias_pairs(self):
+        indices = {p.name: index for index, p in enumerate(self.tensor_parameters)}
+        return tuple((indices[p.alias_of], index) for index, p in enumerate(self.tensor_parameters)
+                     if p.alias_of is not None)
 
     @property
     def tensor_dtype_signatures(self):
@@ -405,16 +415,9 @@ class _Recipe:
 
     @cached_property
     def extended_aclnn(self):
-        return bool(self.attributes or any(
-            p.optional or p.tensor_list or p.device == "cpu" or p.physical_layouts != ("ND",)
-            or p.native_conversions or p.alias_of for p in self.tensor_parameters))
-
-    @property
-    def alias_pairs(self):
-        """Ordered (input index, output index) exact-alias declarations."""
-        indices = {p.name: i for i, p in enumerate(self.tensor_parameters)}
-        return tuple((indices[p.alias_of], i) for i, p in enumerate(self.tensor_parameters)
-                     if p.alias_of is not None)
+        return bool(self.attributes or any(p.optional or p.tensor_list or p.device == "cpu" or p.physical_layouts != ("ND",)
+                                         or p.native_conversions or p.allow_strided or p.alias_of
+                                         for p in self.tensor_parameters))
 
     def validate_attributes(self, values=None):
         values = {} if values is None else dict(values)
@@ -758,6 +761,10 @@ def _build_inputs(recipe):
                      *("csrc/aclnn_torch_adapter/" + f for f in ("call.h", "aclnn_adapter.h", "op_api_common.h",
                          "NPUBridge.h", "NPUBridge.cpp", "NPUStorageImpl.h")))
                       if recipe.schema_version == 2 and recipe.output_kind == "op_package" else ())
+    if recipe.task_type == "aicpu":
+        return ("csrc/cmake/operator/aicpu/CMakeLists.txt",) + adapter_inputs + tuple(
+            r.locator for r in recipe.extra_build_files
+        )
     if recipe.extra_build_files:
         return ("csrc/cmake/operator/CMakeLists.txt", "csrc/cmake/operator/OpPackage.cmake",
                 "csrc/cmake/operator/host/CMakeLists.txt", "csrc/cmake/operator/kernel/CMakeLists.txt"

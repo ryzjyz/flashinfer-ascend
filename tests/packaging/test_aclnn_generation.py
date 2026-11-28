@@ -159,3 +159,61 @@ def test_attribute_schema_roundtrip_and_native_range(kind, value, invalid):
     assert AttributeParameter(**json.loads(json.dumps(param.to_dict()))) == param
     with pytest.raises(SchemaError):
         param.validate(invalid)
+
+
+def test_exact_alias_resolves_optional_and_list_slots(binding):
+    from dataclasses import replace
+
+    import torch
+
+    from flashinfer.jit.recipe import BuildRecipe, TensorParameter
+    from flashinfer.jit.tensor_adapter import _reject_output_overlap
+    from flashinfer.runtime import SchemaError
+
+    optional = TensorParameter("optional", "input", "float32", (2, 4), optional=True)
+    listed = TensorParameter("listed", "input", "float32", (2, 4), tensor_list=True)
+    cache = TensorParameter("cache", "input", "float32", (2, 4), allow_strided=True)
+    output = replace(cache, name="cache_out", role="output", alias_of="cache")
+    recipe = replace(BuildRecipe.from_dict(binding[0]), tensor_parameters=(optional, listed, cache, output),
+                     shape_constraints=(), dtype_signatures=())
+    assert recipe.alias_pairs == ((2, 3),)
+    assert BuildRecipe.from_dict(recipe.to_dict()) == recipe
+    call = generator.torch_call(recipe.to_dict())
+    assert "operands.exact_alias(*t2, *t3);" in call
+    assert call.index("auto t3 = operands.take") < call.index("operands.exact_alias") < call.index("operands.finish")
+    with pytest.raises(SchemaError, match="matching required NPU Tensor input"):
+        replace(recipe, tensor_parameters=(optional, listed, replace(cache, optional=True), output))
+    with pytest.raises(SchemaError, match="matching input and output dtypes"):
+        replace(recipe, dtype_signatures=(("float32",) * 4, ("float32", "float32", "float16", "float32")))
+
+    backing = torch.empty(32)
+    source = backing.as_strided((2, 4), (8, 1), 1)
+    exact = backing.as_strided((2, 4), (8, 1), 1)
+    shifted = backing.as_strided((2, 4), (8, 1), 2)
+    overlap = backing.as_strided((2, 4), (2, 1), 1)
+    flattened = (listed, listed, cache, output)
+    separate = torch.empty((2, 4))
+    _reject_output_overlap(flattened, (separate, separate.clone(), source, exact))
+    with pytest.raises(ValueError, match="exact same storage view"):
+        _reject_output_overlap(flattened, (separate, separate.clone(), source, shifted))
+    with pytest.raises(ValueError, match="must not overlap"):
+        _reject_output_overlap(flattened, (separate, shifted, source, exact))
+    with pytest.raises(ValueError, match="internally overlapping"):
+        _reject_output_overlap(flattened, (separate, separate.clone(), overlap, overlap))
+
+
+def test_low_precision_storage_is_declared_separately_from_strides(binding):
+    from flashinfer.jit.aclnn_contract import TensorDtypeConversion
+    from flashinfer.jit.recipe import TensorParameter
+
+    fp4 = TensorDtypeConversion("float4_e2m1fn_x2", "float4_e2m1", 2)
+    e8m0 = TensorDtypeConversion("float8_e8m0fnu", "float8_e8m0")
+    k = TensorParameter("k", "input", fp4.storage_dtype, (2, 4), allow_strided=True, native_conversions=(fp4,))
+    scale = TensorParameter("scale", "input", e8m0.storage_dtype, (2, 4), native_conversions=(e8m0,))
+    out = TensorParameter("out", "output", "bfloat16", (2, 8))
+    call = generator.torch_call(dict(binding[0], tensor_parameters=[p.to_dict() for p in (k, scale, out)]))
+    assert "auto t0 = operands.take(false, false, false, 1, false, true);" in call
+    assert "auto t1 = operands.take(false, false, false, 1, false);" in call
+    assert "StorageKind::Float4E2M1" in call and "StorageKind::Float8E8M0" in call
+    assert k.native_type(fp4.storage_dtype) == "float4_e2m1"
+    assert scale.native_type(e8m0.storage_dtype) == "float8_e8m0"

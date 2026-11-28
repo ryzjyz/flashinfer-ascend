@@ -62,7 +62,8 @@ def tensor_contract_specialization(kernel_id, tensors):
         devices = {str(tensor.device) for tensor in tensors}
         if len(devices) != 1:
             return "all tensors must share one device"
-        if any(not tensor.is_contiguous() for tensor in tensors):
+        if any(not tensor.is_contiguous() and not parameter.allow_strided
+               for parameter, tensor in zip(recipe.tensor_parameters, tensors)):
             return "all tensors must be contiguous row-major"
     except (SchemaError, ValueError, TypeError) as error:
         return str(error)
@@ -93,7 +94,13 @@ def native_admission(recipe, signature):
             return (
                 "Tensor format violates declared physical_layouts: " + parameter.name,
             )
-    if "0" in dict(signature.specializations).get("tensor_contiguity", ""):
+    contiguity = dict(signature.specializations).get("tensor_contiguity", "")
+    if "0" in contiguity and (
+        len(contiguity) != len(names) or any(
+            flag == "0" and not parameter.allow_strided
+            for flag, parameter in zip(contiguity, recipe.tensor_parameters)
+        )
+    ):
         return ("Ascend C implementation requires contiguous Tensors",)
     return ()
 

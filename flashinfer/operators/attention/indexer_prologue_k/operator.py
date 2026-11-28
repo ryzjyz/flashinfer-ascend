@@ -79,5 +79,5 @@ OPERATOR = OperatorDefinition(
     public_entry="flashinfer.attention.indexer_prologue:indexer_prologue_k",
     description="Mutation-only K prologue: BF16 projection, RMSNorm, tail RoPE and "
                 "per-row INT8/FP16 publication into caller-owned strided caches.",
-    torch_contract=(K_TORCH_SCHEMA, K_MUTATES_ARGS),
+    torch_declarations=torch_declarations,
 )

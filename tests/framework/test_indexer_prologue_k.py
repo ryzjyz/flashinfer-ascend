@@ -113,26 +113,26 @@ def test_singleton_zero_stride_is_accepted_and_non_singleton_zero_is_rejected():
 
 
 def test_tensor_adapter_singleton_zero_stride_and_empty_span():
-    from flashinfer.jit.tensor_adapter import _reject_output_overlap, _validate_strided_cache
+    from flashinfer.jit.tensor_adapter import _reject_output_overlap, _storage_span
 
+    parameter = SimpleNamespace(role="input", alias_of=None, allow_strided=True)
     singleton = torch.as_strided(torch.zeros(256, dtype=torch.int8), (1, 1, 1, 128),
                                  (0, 0, 128, 1), 0)
-    _validate_strided_cache(singleton, "k_cache")
+    _storage_span(parameter, singleton, "ND")
     bad = torch.as_strided(torch.zeros(512, dtype=torch.int8), (2, 1, 1, 128),
                            (0, 0, 128, 1), 0)
     with pytest.raises(ValueError, match="non-singleton"):
-        _validate_strided_cache(bad, "k_cache")
+        _storage_span(parameter, bad, "ND")
 
     empty = torch.empty(0)
-    _reject_output_overlap(
-        (SimpleNamespace(role="output"), SimpleNamespace(role="output")),
-        (empty, empty),
-    )
+    roles = SimpleNamespace(role="output", alias_of=None)
+    _reject_output_overlap((roles, roles), (empty, empty))
     storage = torch.zeros(130)
     strided = torch.as_strided(storage, (2, 2), (64, 1))
     with pytest.raises(ValueError, match="must not overlap"):
         _reject_output_overlap(
-            (SimpleNamespace(role="output"), SimpleNamespace(role="input")),
+            (SimpleNamespace(role="output", alias_of=None),
+             SimpleNamespace(role="input", alias_of=None)),
             (strided, storage),
         )
 
@@ -203,36 +203,50 @@ def test_build_tables_never_write_past_the_128_entry_buffer():
     assert "CopyAddRows(itOff[32], itOff, 64, ROPE_DIM);" not in source
 
 
-def test_declared_torch_contract_matches_registered_schema():
+def test_declared_torch_schema_is_detected_as_void_mutation():
+    from flashinfer.operators.attention.indexer_prologue_k import cases as k_cases
     from flashinfer.operators.attention.indexer_prologue_k.operator import torch_declarations
+    from flashinfer.operators.testing import is_void_mutation
 
     declaration = torch_declarations()[0]
-    assert OPERATOR.torch_contract == (declaration.schema, declaration.mutates_args)
+    assert declaration.schema == OPERATOR.torch_declarations()[0].schema
+    assert declaration.mutates_args == ("k_cache", "k_scale_cache")
+    assert is_void_mutation(OPERATOR, k_cases)
 
 
 def test_rich_capability_fingerprint_covers_torch_schema_and_mutation_set():
     from dataclasses import replace
     from flashinfer.ascendc.attention.indexer_prologue_k.implementation import IMPLEMENTATION
+    from flashinfer.jit.torch_library import AscendCOp
     from flashinfer.operators.attention.indexer_prologue_k.operator import OPERATOR
-    from flashinfer.operators.capability import rich_operator_binding, validate_direct_operator_binding
+    from flashinfer.operators.capability import direct_operator_binding, validate_direct_operator_binding
 
     descriptor = IMPLEMENTATION.bind()
-    base = rich_operator_binding(OPERATOR, descriptor.capability, "ascendc", descriptor.kernel_id)
-    changed_schema = replace(
-        OPERATOR, torch_contract=(
-            OPERATOR.torch_contract[0].replace("Tensor latent", "Tensor latent_changed"),
-            OPERATOR.torch_contract[1]))
-    changed_mutation = replace(
-        OPERATOR, torch_contract=(OPERATOR.torch_contract[0], ("k_cache",)))
-    assert rich_operator_binding(changed_schema, descriptor.capability, "ascendc",
-                                 descriptor.kernel_id).profile_fingerprint != base.profile_fingerprint
-    assert rich_operator_binding(changed_mutation, descriptor.capability, "ascendc",
-                                 descriptor.kernel_id).profile_fingerprint != base.profile_fingerprint
-    changed_binding = rich_operator_binding(changed_schema, descriptor.capability,
-                                            "ascendc", descriptor.kernel_id)
+    base = direct_operator_binding(OPERATOR, descriptor.capability, "ascendc", descriptor.kernel_id)
+    original = OPERATOR.torch_declarations()[0]
+
+    def declaration(schema, mutates):
+        return lambda: (AscendCOp(original.name, schema, original.device_impl,
+                                  original.meta_impl, mutates),)
+
+    changed_schema = replace(OPERATOR, torch_declarations=declaration(
+        original.schema.replace("Tensor latent", "Tensor latent_changed"), original.mutates_args))
+    changed_mutation = replace(OPERATOR, torch_declarations=declaration(
+        original.schema, ("k_cache",)))
+    assert direct_operator_binding(changed_schema, descriptor.capability, "ascendc",
+                                   descriptor.kernel_id).profile_fingerprint != base.profile_fingerprint
+    assert direct_operator_binding(changed_mutation, descriptor.capability, "ascendc",
+                                   descriptor.kernel_id).profile_fingerprint != base.profile_fingerprint
+    changed_binding = direct_operator_binding(changed_schema, descriptor.capability,
+                                              "ascendc", descriptor.kernel_id)
     mismatch = replace(descriptor, capability_binding=changed_binding)
     with pytest.raises(Exception, match="capability"):
         validate_direct_operator_binding(mismatch)
+
+
+def test_public_facade_accepts_generic_harness_routing_options():
+    parameters = inspect.signature(flashinfer.indexer_prologue_k).parameters
+    assert "kernel_id" in parameters and "backend" in parameters
 
 
 def test_tiling_uses_stride_metadata_without_requiring_view_flag():

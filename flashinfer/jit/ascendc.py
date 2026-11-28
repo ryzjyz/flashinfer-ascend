@@ -199,7 +199,8 @@ def compile_recipe(spec, resolved: ResolvedBuildRecipe, toolchain: AscendCToolch
         definitions += ["FI_HOST_ENTRY=" + recipe.host_entry,
                         "FI_BLOCK_DIM=" + str(recipe.block_dim)]
         options = list(recipe.compile_options) + list(spec.compile_options)
-        options.extend("-I" + str(path) for path in toolchain.host_standard_includes)
+        if recipe.task_type != "aicpu":
+            options.extend("-I" + str(path) for path in toolchain.host_standard_includes)
         if recipe.output_kind == "host_shared":
             options.insert(0, "--npu-arch=" + recipe.npu_arch)
         else:
@@ -220,6 +221,8 @@ def compile_recipe(spec, resolved: ResolvedBuildRecipe, toolchain: AscendCToolch
                 variables["FI_ACLNN_RECIPE_FILE"] = [binding_recipe]
             if recipe.cmake_entry is not None:
                 variables["FI_OPERATOR_CMAKE"] = [inputs / recipe.cmake_entry]
+            if recipe.task_type == "aicpu":
+                variables["FI_HEADERS"] = [inputs / ref.locator for ref in recipe.headers]
         request = scratch / "recipe.cmake"
         request.write_text("\n".join("set(%s %s)" % (k, " ".join(_cmake_value(v) for v in values))
                                      for k, values in variables.items()) + "\n", encoding="utf-8")
@@ -235,6 +238,8 @@ def compile_recipe(spec, resolved: ResolvedBuildRecipe, toolchain: AscendCToolch
         env["ASCEND_HOME_PATH"] = str(toolchain.cann_root)
         env["CMAKE_PREFIX_PATH"] = str(toolchain.cann_root / "lib64/cmake")
         cmake_source = inputs / ("csrc/cmake/operator" if recipe.extra_build_files else "csrc")
+        if recipe.task_type == "aicpu":
+            cmake_source = inputs / "csrc/cmake/operator/aicpu"
         commands = [
             [str(toolchain.cmake), "-S", str(cmake_source), "-B", str(scratch / "cmake"),
              "-DFI_RECIPE_FILE=" + str(request), "-DCMAKE_ASC_COMPILER=" + str(toolchain.compiler),
@@ -247,8 +252,9 @@ def compile_recipe(spec, resolved: ResolvedBuildRecipe, toolchain: AscendCToolch
                 "-DENABLE_SOURCE_PACKAGE=OFF", "-DENABLE_BINARY_PACKAGE=ON",
                 "-DASCEND_SKIP_FAILED_COMPUTE_UNIT=OFF", "-Dvendor_name=" + recipe.package_vendor,
                 "-DCMAKE_INSTALL_PREFIX=" + str(scratch / "cmake")]
+            targets = ["package"] if recipe.task_type == "aicpu" else ["binary", "package"]
             commands.append([str(toolchain.cmake), "--build", str(scratch / "cmake"),
-                             "--target", "binary", "package", "--verbose", "-j2"])
+                             "--target", *targets, "--verbose", "-j2"])
         with log_path.open("w", encoding="utf-8") as log:
             for command in commands:
                 log.write("command: " + json.dumps(command) + "\n")

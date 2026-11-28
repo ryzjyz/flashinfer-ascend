@@ -151,11 +151,12 @@ def public_function(name):
     public_signature = python_signature(schema_arguments(record["schema"])[0] + (
         ("object", "out", None, True), ("str?", "backend", None, True),
         ("str?", "kernel_id", None, True)))
+    output_names = tuple(record["output_names"])
+
     def call(*args, **kwargs):
         import torch
         from flashinfer.aclnn._ops import ensure_registered
-        operator = definition(record["op"])
-        bound = operator.public_signature.bind(*args, **kwargs)
+        bound = public_signature.bind(*args, **kwargs)
         bound.apply_defaults()
         arguments = dict(bound.arguments)
         out = arguments.pop("out")
@@ -163,10 +164,10 @@ def public_function(name):
         ensure_registered()
         if out is None:
             return getattr(torch.ops.flashinfer, name)(**arguments)
-        outputs = (out,) if len(operator.output_names) == 1 and isinstance(out, torch.Tensor) else out
-        if not isinstance(outputs, (tuple, list)) or len(outputs) != len(operator.output_names):
+        outputs = (out,) if len(output_names) == 1 and isinstance(out, torch.Tensor) else out
+        if not isinstance(outputs, (tuple, list)) or len(outputs) != len(output_names):
             raise ValueError("out must supply every declared output Tensor")
-        getattr(torch.ops.flashinfer, name + "_out")(**arguments, **dict(zip(operator.output_names, outputs)))
+        getattr(torch.ops.flashinfer, name + "_out")(**arguments, **dict(zip(output_names, outputs)))
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
     call.__name__ = name
     call.__qualname__ = name

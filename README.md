@@ -42,8 +42,8 @@
 
 | 产品系列 | 物理 SoC | 源码架构 | wheel 包名 | 原生 AOT 算子示例 |
 | --- | --- | --- | --- | --- |
-| A2 | `Ascend910B` | arch22 | `flashinfer_ascend910b` | GMM/SwiGLU/量化、SFA、PermuteQkv、UnpermuteQkv、Histgram、MergeChunk2、CATLASS prefill |
-| A3 | `Ascend910C` | arch22 | `flashinfer_ascend910b` | GMM/SwiGLU/量化、SFA、PermuteQkv、UnpermuteQkv、Histgram、MergeChunk2、CATLASS prefill |
+| A2 | `Ascend910B` | arch22 | `flashinfer_ascend910b` | GMM/SwiGLU/量化、SFA、DsaSparseProlog、PermuteQkv、UnpermuteQkv、Histgram、MergeChunk2、CATLASS prefill |
+| A3 | `Ascend910C` | arch22 | `flashinfer_ascend910b` | GMM/SwiGLU/量化、SFA、DsaSparseProlog、PermuteQkv、UnpermuteQkv、Histgram、MergeChunk2、CATLASS prefill |
 | A5 | `Ascend950` | arch35 | `flashinfer_ascend950` | Matmul、MatmulBiasSiLU、CATLASS prefill |
 
 A2/A3 共享源码架构与发行包，各自使用严格绑定物理 SoC 的产物。A3 的编译目标和测试入口已登记，真机数值及安装验证尚未完成；CANN/Triton 的支持域仍按具体算子声明判断。

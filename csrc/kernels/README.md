@@ -13,6 +13,7 @@ Ascend C operator sources live under `csrc/kernels/<domain>/<op>/`. Use `python 
 - `gemm/grouped_matmul_k_dim/`: grouped FP16/BF16 matmul whose groups split the shared K axis.
 - `attention/flash_attention/`: production CATLASS implementation.
 - `attention/sparse_flash_attention/`: arch22 MLA sparse attention, with separate A2 and A3 AOT declarations.
+- `attention/dsa_sparse_prolog/`: arch22 DSA sparse prolog shared by Ascend910B and Ascend910C.
 
 Each operator owns `op_host/` (OpDef, inference and tiling), `op_kernel/`
 (device code) and `include/` (shared tiling layouts). Production recipes are generated under
