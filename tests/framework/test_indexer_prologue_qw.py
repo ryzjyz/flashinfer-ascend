@@ -1,6 +1,7 @@
 """Public QW contracts, FakeTensor metadata and native ABI declarations."""
 
 import inspect
+from dataclasses import replace
 
 import pytest
 import torch
@@ -11,15 +12,12 @@ from flashinfer.ascendc.attention.indexer_prologue_qw.implementation import IMPL
 from flashinfer.ascendc.attention.indexer_prologue_qw_prequantized.implementation import (
     IMPLEMENTATION as PREQUANTIZED,
 )
-from flashinfer.operators.attention.indexer_prologue_qw.operator import OPERATOR as DENSE_OP
-from flashinfer.operators.attention.indexer_prologue_qw_prequantized.operator import (
-    OPERATOR as PREQUANTIZED_OP,
-)
+from flashinfer.operators.attention.indexer_prologue_qw.operator import OPERATOR
 from flashinfer.operators.runtime import fake, signature
 from flashinfer.runtime import GraphCapability, HardwareSignature, dispatch
 
 DENSE_ID = "ascendc/attention/indexer_prologue_qw/native/op_package/Ascend910B"
-PREQ_ID = "ascendc/attention/indexer_prologue_qw_prequantized/native/op_package/Ascend910B"
+PREQ_ID = "ascendc/attention/indexer_prologue_qw/prequantized/native/op_package/Ascend910B"
 
 
 def dense_arguments(tokens=3, softmax_scale=128 ** -0.5):
@@ -36,31 +34,30 @@ def dense_arguments(tokens=3, softmax_scale=128 ** -0.5):
 
 def prequantized_arguments(tokens=3):
     args = dense_arguments(tokens)
-    args.pop("wqb")
-    args["wqb_nz"] = torch.zeros(1280, 4096, dtype=torch.int8)
+    args["wqb"] = torch.zeros(1280, 4096, dtype=torch.int8)
     args["wqb_scale"] = torch.zeros(4096)
+    args["prequantized"] = True
     return args
 
 
-def test_public_exports_share_the_declared_interfaces():
+def test_public_exports_share_the_declared_interface():
     assert flashinfer.indexer_prologue_qw is flashinfer.attention.indexer_prologue_qw
-    assert flashinfer.indexer_prologue_qw_prequantized is (
-        flashinfer.attention.indexer_prologue_qw_prequantized
-    )
-    assert inspect.signature(flashinfer.indexer_prologue_qw) == DENSE_OP.public_signature
-    assert inspect.signature(flashinfer.indexer_prologue_qw_prequantized) == (
-        PREQUANTIZED_OP.public_signature
-    )
+    assert not hasattr(flashinfer, "indexer_prologue_qw_prequantized")
+    assert inspect.signature(flashinfer.indexer_prologue_qw) == OPERATOR.public_signature
 
 
 def test_fake_shapes_dtypes_and_dispatch():
-    outputs = fake(DENSE_OP.op, dense_arguments())
+    outputs = fake(OPERATOR.op, dense_arguments())
     assert [tuple(t.shape) for t in outputs] == [(3, 32, 128), (3, 32), (3, 32)]
     assert [t.dtype for t in outputs] == [torch.int8, torch.float16, torch.float16]
-    outputs = fake(PREQUANTIZED_OP.op, prequantized_arguments())
+    outputs = fake(OPERATOR.op, prequantized_arguments())
     assert [tuple(t.shape) for t in outputs] == [(3, 32, 128), (3, 32), (3, 32)]
-    request, _, _ = signature(DENSE_OP.op, dense_arguments())
+    request, _, _ = signature(OPERATOR.op, dense_arguments())
     assert dispatch(request, HardwareSignature("Ascend910B", 20)).kernel_id == DENSE_ID
+    request, _, _ = signature(OPERATOR.op, prequantized_arguments())
+    request = replace(request, physical_layouts=(
+        "ND", "ND", "NZ", "ND", "ND", "ND", "ND", "ND", "ND", "ND"))
+    assert dispatch(request, HardwareSignature("Ascend910B", 20)).kernel_id == PREQ_ID
     with pytest.raises(RuntimeError):
         dispatch(request, HardwareSignature("Ascend950", 32), kernel_id=DENSE_ID)
 
@@ -89,31 +86,22 @@ def test_native_abi_and_graph_capability_are_exact():
 ])
 def test_invalid_dense_metadata_is_rejected(change):
     with pytest.raises(ValueError):
-        fake(DENSE_OP.op, dict(dense_arguments(), **change))
+        fake(OPERATOR.op, dict(dense_arguments(), **change))
 
 
 @pytest.mark.parametrize("change", [
-    {"wqb_nz": torch.zeros(1280, 4096, dtype=torch.float16)},
+    {"wqb": torch.zeros(1280, 4096, dtype=torch.float16)},
     {"wqb_scale": torch.zeros(4096, dtype=torch.float16)},
-    {"wqb_nz": torch.zeros(1281, 4096, dtype=torch.int8)},
+    {"wqb": torch.zeros(1281, 4096, dtype=torch.int8)},
 ])
 def test_invalid_prequantized_metadata_is_rejected(change):
     with pytest.raises(ValueError):
-        fake(PREQUANTIZED_OP.op, dict(prequantized_arguments(), **change))
+        fake(OPERATOR.op, dict(prequantized_arguments(), **change))
 
 
 def test_zero_tokens_are_rejected_for_qw():
     with pytest.raises(ValueError):
-        fake(DENSE_OP.op, dense_arguments(tokens=0))
-
-
-def test_prequantized_physical_layout_is_required_when_known():
-    args = prequantized_arguments()
-    layouts = {name: "ND" for name in args if isinstance(args[name], torch.Tensor)}
-    with pytest.raises(ValueError, match="FRACTAL_NZ"):
-        PREQUANTIZED_OP.infer(args, layouts)
-    layouts["wqb_nz"] = "NZ"
-    PREQUANTIZED_OP.infer(args, layouts)
+        fake(OPERATOR.op, dense_arguments(tokens=0))
 
 
 def test_device_user_workspace_and_public_token_length_proofs():

@@ -33,6 +33,8 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
             accumulator_dtypes=("int32",),
             fusion_ops=("dynamic_quantize", "quantized_matmul", "rope", "dynamic_quantize"),
             auxiliary_outputs=("q_scale", "w"),
+            specializations=(("quant.activation", ("per_token_int8",)),
+                             ("quant.weight", ("per_channel_int8",))),
         ),),
     ),
     build=BuildConfig(

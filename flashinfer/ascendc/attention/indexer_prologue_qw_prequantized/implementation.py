@@ -8,7 +8,7 @@ DynamicQuant, transpose or NZ conversion inside the forward.
 from flashinfer.ascendc.definition import AscendCImplementation, BuildConfig, NativeBinding
 from flashinfer.jit.aclnn_contract import AttributeParameter
 from flashinfer.jit.recipe import ShapeConstraint, TensorParameter
-from flashinfer.operators.attention.indexer_prologue_qw_prequantized.operator import OPERATOR
+from flashinfer.operators.attention.indexer_prologue_qw.operator import OPERATOR
 from flashinfer.operators.author_api import Support
 from flashinfer.runtime import CapabilityCase
 from flashinfer.runtime.targets import ARCH22_SOCS
@@ -24,7 +24,7 @@ def _tensor(name, role, dtype, shape, layouts=("ND",)):
 
 IMPLEMENTATIONS = AscendCImplementation.for_targets(
     operator=OPERATOR,
-    name="native/op_package",
+    name="prequantized/native/op_package",
     default_target="Ascend910B",
     support=Support(
         soc_models=ARCH22_SOCS,
@@ -35,6 +35,7 @@ IMPLEMENTATIONS = AscendCImplementation.for_targets(
             accumulator_dtypes=("int32",),
             fusion_ops=("quantized_matmul", "rope", "dynamic_quantize"),
             auxiliary_outputs=("q_scale", "w"),
+            specializations=(("quant.weight", ("caller_prequantized_nz",)),),
         ),),
     ),
     build=BuildConfig(

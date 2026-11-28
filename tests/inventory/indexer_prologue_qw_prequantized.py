@@ -6,9 +6,9 @@ from tests.inventory import ReviewedKernel
 
 KERNELS = tuple(
     ReviewedKernel(
-        "ascendc/attention/indexer_prologue_qw_prequantized/native/op_package/" + soc,
+        "ascendc/attention/indexer_prologue_qw/prequantized/native/op_package/" + soc,
         CapabilitySpec(
-            op="attention.indexer_prologue_qw_prequantized",
+            op="attention.indexer_prologue_qw",
             soc_models=(soc,),
             dtypes=("bfloat16", "int8", "float16", "float32"),
             cases=(CapabilityCase(
@@ -17,6 +17,7 @@ KERNELS = tuple(
                 accumulator_dtypes=("int32",),
                 fusion_ops=("quantized_matmul", "rope", "dynamic_quantize"),
                 auxiliary_outputs=("q_scale", "w"),
+                specializations=(("quant.weight", ("caller_prequantized_nz",)),),
             ),),
         ),
         backend="ascendc", native_recipe=("indexer_prologue_qw_prequantized", "native"),

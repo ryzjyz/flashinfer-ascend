@@ -45,27 +45,27 @@ def test_wrong_nz_direction_is_rejected_in_a_cold_process(tmp_path):
     from flashinfer.operators.pytest_support import prepare_release
     from flashinfer.runtime import current_hardware
 
-    kernel_id = ("ascendc/attention/indexer_prologue_qw_prequantized/"
-                 "native/op_package/" + current_hardware().soc_model)
+    kernel_id = ("ascendc/attention/indexer_prologue_qw/"
+                 "prequantized/native/op_package/" + current_hardware().soc_model)
     release = prepare_release(
-        "attention.indexer_prologue_qw_prequantized", tmp_path, kernel_id=kernel_id)
+        "attention.indexer_prologue_qw", tmp_path, kernel_id=kernel_id)
     code = r'''
 import torch
 import torch_npu
 import flashinfer
-from flashinfer.operators.attention.indexer_prologue_qw_prequantized import cases
+from flashinfer.operators.attention.indexer_prologue_qw import cases
 
 torch.npu.set_device(int(__import__('os').environ.get("FLASHINFER_TEST_NPU_DEVICE", "0")))
 torch.npu.config.allow_internal_format = True
-args, options, _ = cases.sample(torch, torch_npu, tokens=3)
+args, options, _ = cases.sample(torch, torch_npu, tokens=3, prequantized=True)
 source = torch.randn(4096, 1280).to(torch.bfloat16).npu()
 weight_q, weight_scale = torch_npu.npu_dynamic_quant(source, dst_type=torch.int8)
 wrong = torch.as_strided(torch_npu.npu_format_cast(weight_q, 29),
                          (1280, 4096), (4096, 1), 0)
 assert torch_npu.get_npu_format(wrong) == 29 and wrong.is_contiguous()
 try:
-    flashinfer.indexer_prologue_qw_prequantized(
-        args[0], args[1], wrong, weight_scale, args[4], args[5], args[6], **options)
+    flashinfer.indexer_prologue_qw(
+        args[0], args[1], wrong, args[3], args[4], args[5], **options)
 except (ValueError, RuntimeError) as error:
     print(str(error))
     print("REJECTED")
